@@ -24,8 +24,11 @@ from flask import Response
 import base64
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# logging.basicConfig(level=logging.INFO) # Will be replaced by more detailed config
+
+# --- Logging Configuration ---
+logger = logging.getLogger(__name__) # Get logger for the app
+# Note: Actual handler configuration will be done after app_config is loaded.
 
 # --- Graceful Dependency Handling ---
 # Attempt to import WeasyPrint for PDF export
@@ -63,7 +66,10 @@ app = Flask(__name__)
 CORS(app)
 
 # Session management
-app.config['SECRET_KEY'] = "a_very_secret_and_stable_key_for_development_do_not_use_in_prod"
+SECRET_KEY_FALLBACK = "a_very_secret_and_stable_key_for_development_do_not_use_in_prod"
+app.config['SECRET_KEY'] = os.environ.get('FLASK_SECRET_KEY', SECRET_KEY_FALLBACK)
+if app.config['SECRET_KEY'] == SECRET_KEY_FALLBACK:
+    logger.warning("WARNING: FLASK_SECRET_KEY environment variable not set. Using a default, insecure key for development. SET THIS VARIABLE IN PRODUCTION!")
 app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(minutes=30) # Example: 30 minutes timeout
 
 # Initialize Flask-Login
@@ -118,7 +124,10 @@ class ConfigLoader:
             "server": {
                 "host": "0.0.0.0",
                 "port": 5000,
-                "debug": True
+                "debug": False,
+                "log_file": "mikrotik_dashboard.log",
+                "log_level_console": "INFO",
+                "log_level_file": "INFO"
             },
             "app_admin": {
                 "username": "admin",
@@ -190,6 +199,49 @@ class ConfigLoader:
 # Initialize ConfigLoader
 config_loader = ConfigLoader()
 app_config = config_loader.get_config()
+
+
+# --- Setup Logging Handlers (after app_config is available) ---
+def setup_logging(app_config_instance):
+    _logger = logging.getLogger(__name__) # Use module-level logger
+    _logger.setLevel(logging.INFO) # Default log level
+
+    # Clear existing handlers if any (to avoid duplicate logs on reloads in dev)
+    if _logger.hasHandlers():
+        _logger.handlers.clear()
+
+    # Formatter
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+
+    # Console Handler
+    ch = logging.StreamHandler()
+    # Use log_level_console from server config, or default to INFO
+    console_log_level_str = app_config_instance.get('server', {}).get('log_level_console', 'INFO').upper()
+    console_log_level = getattr(logging, console_log_level_str, logging.INFO)
+    ch.setLevel(console_log_level)
+    ch.setFormatter(formatter)
+    _logger.addHandler(ch)
+    _logger.info(f"Console logging configured with level: {logging.getLevelName(ch.level)}") # Use ch.level for accuracy
+
+    # File Handler
+    try:
+        log_file_path = app_config_instance.get('server', {}).get('log_file', 'mikrotik_dashboard.log')
+        log_dir = os.path.dirname(log_file_path)
+        if log_dir and not os.path.exists(log_dir):
+            os.makedirs(log_dir, exist_ok=True)
+
+        fh = logging.FileHandler(log_file_path)
+        file_log_level_str = app_config_instance.get('server', {}).get('log_level_file', 'INFO').upper()
+        file_log_level = getattr(logging, file_log_level_str, logging.INFO) # Default to INFO if invalid
+        fh.setLevel(file_log_level)
+        fh.setFormatter(formatter)
+        _logger.addHandler(fh)
+        _logger.info(f"File logging configured to: {log_file_path} with level: {file_log_level_str}")
+    except Exception as e:
+        _logger.error(f"Failed to configure file logging: {e}", exc_info=True)
+
+setup_logging(app_config) # Call the setup function with the loaded app_config
+
 
 # --- User Class for Flask-Login ---
 class User(UserMixin):
@@ -506,12 +558,14 @@ def download_batch_vouchers_pdf():
         vouchers_json = request.form.get('vouchers_json', '[]')
         hotspot_login_url = request.form.get('hotspot_login_url', '')
         vouchers = json.loads(vouchers_json)
+        # Removed logging line
 
         if not vouchers:
             return jsonify({'success': False, 'message': 'No voucher data provided.'}), 400
         
         # Generate HTML without the print button for PDF rendering
         html_content = _generate_vouchers_page_html(vouchers, hotspot_login_url, include_print_button=False)
+        # Removed logging line
         
         pdf_file = WeasyHTML(string=html_content).write_pdf()
         
@@ -1374,7 +1428,9 @@ def export_users_route():
             if not WEASYPRINT_AVAILABLE:
                 return jsonify({"success": False, "message": _("PDF generation is disabled. Please install system dependencies for WeasyPrint and restart the application.")}), 501
             
+            # Removed logging line
             html_content = _generate_vouchers_page_html(vouchers_data, login_url, include_print_button=False)
+            # Removed logging line
             try:
                 pdf_file = WeasyHTML(string=html_content).write_pdf()
                 return Response(
