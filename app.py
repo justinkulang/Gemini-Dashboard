@@ -1,6 +1,6 @@
 """Mikrotik Hotspot User Management Backend - v2
 Major overhaul with a redesigned UI, profile management, filtered exports, QR codes, and more."""
-from flask import Flask, render_template, request, jsonify, send_from_directory, g, redirect, url_for
+from flask import Flask, render_template, request, jsonify, send_from_directory, g, redirect, url_for, session # Add session
 from flask_cors import CORS
 from flask_babel import Babel, get_locale, _ # Re-add get_locale
 from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
@@ -63,7 +63,7 @@ app = Flask(__name__)
 CORS(app)
 
 # Session management
-app.config['SECRET_KEY'] = os.urandom(24) # Needed for Flask sessions and Flask-Login
+app.config['SECRET_KEY'] = "a_very_secret_and_stable_key_for_development_do_not_use_in_prod"
 app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(minutes=30) # Example: 30 minutes timeout
 
 # Initialize Flask-Login
@@ -119,6 +119,10 @@ class ConfigLoader:
                 "host": "0.0.0.0",
                 "port": 5000,
                 "debug": True
+            },
+            "app_admin": {
+                "username": "admin",
+                "password_hash": "pbkdf2:sha256:600000$zR0gQY0gV0gY0gV0$c2df639e9e31b0cf9352d789a8f074d2f6a603cf8bd77a9a20addf32089e11f9" # Default for "changeme"
             }
         }
 
@@ -126,10 +130,19 @@ class ConfigLoader:
             with open(self.config_file, 'r') as f:
                 loaded_config = json.load(f)
                 # Deep merge with default to ensure new keys are present
+                # For mikrotik and server, update the default_config's sections with loaded values
                 default_config['mikrotik'].update(loaded_config.get('mikrotik', {}))
                 default_config['server'].update(loaded_config.get('server', {}))
+
+                # For app_admin, ensure it exists in default_config then update it
+                # This handles cases where app_admin might not be in an old config file
+                if 'app_admin' not in default_config: # Should not happen given the new default_config structure
+                    default_config['app_admin'] = {}
+                default_config['app_admin'].update(loaded_config.get('app_admin', {}))
+
                 return default_config
         else:
+            # If config file doesn't exist, write the full default_config (including new app_admin)
             with open(self.config_file, 'w') as f:
                 json.dump(default_config, f, indent=4)
             return default_config
@@ -185,9 +198,6 @@ class User(UserMixin):
 
     @staticmethod
     def get(user_id):
-        # In a real app, you'd query a database. Here, we check against config.
-        # For simplicity, we'll assume one admin user.
-        # The user_id stored in the session will be the username.
         admin_username = app_config.get('app_admin', {}).get('username')
         if user_id == admin_username:
             return User(user_id)
@@ -195,10 +205,11 @@ class User(UserMixin):
 
 @login_manager.user_loader
 def load_user(user_id):
-    return User.get(user_id)
+    user = User.get(user_id)
+    return user
 
 # Define exempt endpoints that do not require a Mikrotik connection OR app login initially
-MIKROTIK_EXEMPT_ENDPOINTS = {'login_page', 'app_login', 'initial_connect', 'static', 'get_translations'}
+MIKROTIK_EXEMPT_ENDPOINTS = {'login_page', 'app_login_route', 'initial_connect', 'static', 'get_translations'}
 # CSRF protection will be enabled by default for all POST/PUT/DELETE requests.
 # We might need to exempt specific routes if they are called from external systems not using our CSRF flow.
 # For now, all internal POSTs should be protected. login_page and app_login are POST but are handled.
@@ -208,7 +219,10 @@ def before_request_handler():
     logger.debug(f"before_request: endpoint='{request.endpoint}', path='{request.path}'")
 
     # 1. Flask-Login Authentication Check
-    login_exempt_for_auth = request.endpoint in ['login_page', 'app_login', 'static', 'get_translations']
+    login_exempt_for_auth = request.endpoint in ['login_page', 'app_login_route', 'static', 'get_translations']
+
+    # Removed temporary debug logging from here
+
     if not login_exempt_for_auth and not current_user.is_authenticated:
         logger.info(f"User not authenticated for endpoint '{request.endpoint}'. Redirecting to login page.")
         return redirect(url_for('login_page'))

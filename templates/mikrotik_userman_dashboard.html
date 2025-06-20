@@ -729,7 +729,8 @@ async function apiCall(endpoint, options = {}) {
     // Update options with potentially modified headers
     const fetchOptions = {
         ...options,
-        headers: headers
+        headers: headers,
+        credentials: 'include' // Explicitly add this line
     };
 
     try {
