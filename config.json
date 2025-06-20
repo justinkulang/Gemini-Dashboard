@@ -11,5 +11,9 @@
         "host": "0.0.0.0",
         "port": 5000,
         "debug": true
+    },
+    "app_admin": {
+        "username": "admin",
+        "password_hash": "scrypt:32768:8:1$hFP2ZVBanY1DUisf$fc7385734fa3722836ac96108007cfc7f804ae9abf066e7b100ece76632a11a44a9fd7b6ceba1f1da0daafb9ec4ceb752ae56352334dcfdf409fc55bccfddc09"
     }
 }

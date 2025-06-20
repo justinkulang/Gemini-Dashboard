@@ -3,6 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="csrf-token" content="{{ csrf_token() }}">
     <title>Connect to Mikrotik - Hotspot Manager</title>
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.1.1/css/all.min.css" rel="stylesheet">
     <style>
@@ -124,10 +125,31 @@
 </head>
 <body>
     <div class="login-container">
-        <h2>Connect to Mikrotik Router</h2>
-        <form id="loginForm">
-            <div class="form-group">
-                <label for="routerHost">Router IP Address</label>
+        <!-- Web App Login Form -->
+        <div id="appLoginSection">
+            <h2>Hotspot Manager Login</h2>
+            <form id="appLoginForm">
+                <div class="form-group">
+                    <label for="appUsername">Admin Username</label>
+                    <input type="text" id="appUsername" placeholder="Enter admin username" required>
+                </div>
+                <div class="form-group">
+                    <label for="appPassword">Admin Password</label>
+                    <input type="password" id="appPassword" placeholder="Enter admin password" required>
+                </div>
+                <button type="submit" class="login-button">
+                    <i class="fas fa-sign-in-alt"></i> Login to App
+                </button>
+                <div id="appErrorMessage" class="alert" style="display: none;"></div>
+            </form>
+        </div>
+
+        <!-- Mikrotik Connection Form (Initially Hidden) -->
+        <div id="mikrotikLoginSection" style="display: none;">
+            <h2>Connect to Mikrotik Router</h2>
+            <form id="mikrotikLoginForm"> <!-- Changed ID -->
+                <div class="form-group">
+                    <label for="routerHost">Router IP Address</label>
                 <input type="text" id="routerHost" placeholder="e.g., 192.168.88.1" required value="192.168.88.1">
             </div>
             <div class="form-group">
@@ -143,90 +165,180 @@
                 <input type="password" id="routerPassword" placeholder="Enter password" required>
             </div>
             <button type="submit" class="login-button">
-                <i class="fas fa-plug"></i> Connect
+                <i class="fas fa-plug"></i> Connect to Router
             </button>
-            <div id="errorMessage" class="alert" style="display: none;"></div> <!-- Error messages will appear here -->
-        </form>
+            <div id="mikrotikErrorMessage" class="alert" style="display: none;"></div> <!-- Changed ID -->
+            </form>
+        </div>
     </div>
 
     <script>
-        document.getElementById('loginForm').addEventListener('submit', function(event) {
-            event.preventDefault(); // Prevent actual form submission
+        // Translations object (populated by /api/translations)
+        let i18n = {};
+
+        // Function to get translated string
+        function _(key, ...args) {
+            let translation = i18n[key] || key;
+            if (args.length > 0) {
+                args.forEach((arg, index) => {
+                    translation = translation.replace(new RegExp(`\\{${index}\\}`, 'g'), arg);
+                });
+            }
+            return translation;
+        }
+
+        // Fetch translations first
+        async function fetchTranslations() {
+            try {
+                const response = await fetch('/api/translations'); // This is a GET, no CSRF needed
+                if (!response.ok) {
+                    console.error('Failed to load translations:', response.status);
+                    return;
+                }
+                i18n = await response.json();
+            } catch (error) {
+                console.error('Error fetching translations:', error);
+            }
+        }
+
+        // Function to get CSRF token from meta tag
+        function getCsrfToken() {
+            return document.querySelector('meta[name="csrf-token"]').getAttribute('content');
+        }
+
+        // App Login Form Handler
+        document.getElementById('appLoginForm').addEventListener('submit', function(event) {
+            event.preventDefault();
+            const csrfToken = getCsrfToken(); // Get CSRF token
+            const username = document.getElementById('appUsername').value;
+            const password = document.getElementById('appPassword').value;
+            const appErrorMessageDiv = document.getElementById('appErrorMessage');
+            const appLoginButton = this.querySelector('button[type="submit"]');
+            const originalButtonHTML = appLoginButton.innerHTML;
+
+            appErrorMessageDiv.textContent = '';
+            appErrorMessageDiv.style.display = 'none';
+            appErrorMessageDiv.className = 'alert';
+
+            if (!username || !password) {
+                appErrorMessageDiv.textContent = _('Username and password are required.'); // Example of using _
+                appErrorMessageDiv.className = 'alert alert-danger';
+                appErrorMessageDiv.style.display = 'block';
+                return;
+            }
+
+            appLoginButton.disabled = true;
+            appLoginButton.innerHTML = `<span class="loading-spinner"></span> ${_('Connecting...')}`;
+
+            fetch('/app-login', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/x-www-form-urlencoded',
+                    'X-CSRFToken': csrfToken // Add CSRF token to header
+                },
+                body: new URLSearchParams({ app_username: username, app_password: password })
+            })
+            .then(response => response.json().then(data => ({ ok: response.ok, status: response.status, data })))
+            .then(({ ok, status, data }) => {
+                if (ok && data.success) {
+                    appErrorMessageDiv.textContent = data.message || _('Successfully connected! Redirecting...');
+                    appErrorMessageDiv.className = 'alert alert-success';
+                    appErrorMessageDiv.style.display = 'block';
+                    // Hide app login, show Mikrotik login
+                    document.getElementById('appLoginSection').style.display = 'none';
+                    document.getElementById('mikrotikLoginSection').style.display = 'block';
+                    // Potentially fetch Mikrotik config if needed here, or dashboard will handle it
+                } else {
+                    appErrorMessageDiv.textContent = data.message || _('Connection failed (Error {0}). Please check details and try again.', status);
+                    appErrorMessageDiv.className = 'alert alert-danger';
+                    appErrorMessageDiv.style.display = 'block';
+                }
+            })
+            .catch(error => {
+                console.error('Error during app login fetch:', error);
+                appErrorMessageDiv.textContent = _('Network error or server is unreachable.');
+                appErrorMessageDiv.className = 'alert alert-danger';
+                appErrorMessageDiv.style.display = 'block';
+            })
+            .finally(() => {
+                // Only restore button if not successful
+                if (!appErrorMessageDiv.classList.contains('alert-success')) {
+                     appLoginButton.disabled = false;
+                     appLoginButton.innerHTML = originalButtonHTML;
+                }
+            });
+        });
+
+        // Mikrotik Login Form Handler (Original functionality, adapted)
+        document.getElementById('mikrotikLoginForm').addEventListener('submit', function(event) {
+            event.preventDefault();
+            const csrfToken = getCsrfToken(); // Get CSRF token
 
             const host = document.getElementById('routerHost').value;
             const port = document.getElementById('routerPort').value;
             const username = document.getElementById('routerUsername').value;
             const password = document.getElementById('routerPassword').value;
-            const errorMessageDiv = document.getElementById('errorMessage');
+            const mikrotikErrorMessageDiv = document.getElementById('mikrotikErrorMessage'); // Changed ID
             const connectButton = this.querySelector('button[type="submit"]');
-            const originalButtonHTML = connectButton.innerHTML; // Store original button content
+            const originalButtonHTML = connectButton.innerHTML;
 
-            // Clear previous error messages and hide
-            errorMessageDiv.textContent = '';
-            errorMessageDiv.style.display = 'none';
-            errorMessageDiv.className = 'alert'; // Reset classes
+            mikrotikErrorMessageDiv.textContent = '';
+            mikrotikErrorMessageDiv.style.display = 'none';
+            mikrotikErrorMessageDiv.className = 'alert';
 
-            // Basic client-side validation
-            if (!host || !port || !username) { // Password can be empty for some router configs
-                errorMessageDiv.textContent = 'Router IP, Port, and Username are required.';
-                errorMessageDiv.className = 'alert alert-danger';
-                errorMessageDiv.style.display = 'block';
+            if (!host || !port || !username) {
+                mikrotikErrorMessageDiv.textContent = _('Router IP, Port, and Username are required.');
+                mikrotikErrorMessageDiv.className = 'alert alert-danger';
+                mikrotikErrorMessageDiv.style.display = 'block';
                 return;
             }
             if (parseInt(port) <= 0 || parseInt(port) > 65535) {
-                 errorMessageDiv.textContent = 'Please enter a valid port number (1-65535).';
-                 errorMessageDiv.className = 'alert alert-danger';
-                 errorMessageDiv.style.display = 'block';
+                 mikrotikErrorMessageDiv.textContent = _('Please enter a valid port number (1-65535).');
+                 mikrotikErrorMessageDiv.className = 'alert alert-danger';
+                 mikrotikErrorMessageDiv.style.display = 'block';
                 return;
             }
 
-            // Disable button and show spinner
             connectButton.disabled = true;
-            connectButton.innerHTML = '<span class="loading-spinner"></span> Connecting...';
+            connectButton.innerHTML = `<span class="loading-spinner"></span> ${_('Connecting...')}`;
 
-            fetch('/api/initial-connect', {
+            fetch('/api/initial-connect', { // This endpoint now assumes app is already logged in
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
+                    'X-CSRFToken': csrfToken // Add CSRF token to header
                 },
                 body: JSON.stringify({ host, port: parseInt(port), username, password }),
             })
-            .then(response => {
-                // Store response.ok and response.status before response.json() consumes the body
-                const isOk = response.ok;
-                const status = response.status;
-                // Try to parse JSON irrespective of response.ok, as backend might send error details in JSON
-                return response.json().then(data => ({ isOk, status, data }));
-            })
-            .then(({ isOk, status, data }) => {
-                if (isOk && data.success) {
-                    errorMessageDiv.textContent = 'Successfully connected! Redirecting...';
-                    errorMessageDiv.className = 'alert alert-success';
-                    errorMessageDiv.style.display = 'block';
-                    // Redirect to dashboard
+            .then(response => response.json().then(data => ({ ok: response.ok, status: response.status, data })))
+            .then(({ ok, status, data }) => {
+                if (ok && data.success) {
+                    mikrotikErrorMessageDiv.textContent = data.message || _('Successfully connected! Redirecting...');
+                    mikrotikErrorMessageDiv.className = 'alert alert-success';
+                    mikrotikErrorMessageDiv.style.display = 'block';
                     window.location.href = '/dashboard';
                 } else {
-                    // Use message from backend (data.message) if available, otherwise a generic one
-                    errorMessageDiv.textContent = data.message || `Connection failed (Error ${status}). Please check details and try again.`;
-                    errorMessageDiv.className = 'alert alert-danger';
-                    errorMessageDiv.style.display = 'block';
+                    mikrotikErrorMessageDiv.textContent = data.message || _('Connection failed (Error {0}). Please check details and try again.', status);
+                    mikrotikErrorMessageDiv.className = 'alert alert-danger';
+                    mikrotikErrorMessageDiv.style.display = 'block';
                 }
             })
             .catch(error => {
-                // This catches network errors, or errors if response.json() fails (e.g. non-JSON response)
-                console.error('Error during initial connect fetch:', error);
-                errorMessageDiv.textContent = 'Network error or server is unreachable. Please check your network connection and try again.';
-                errorMessageDiv.className = 'alert alert-danger';
-                errorMessageDiv.style.display = 'block';
+                console.error('Error during Mikrotik connect fetch:', error);
+                mikrotikErrorMessageDiv.textContent = _('Network error or server is unreachable.');
+                mikrotikErrorMessageDiv.className = 'alert alert-danger';
+                mikrotikErrorMessageDiv.style.display = 'block';
             })
             .finally(() => {
-                // Re-enable button and restore original content only if not redirecting
-                if (!errorMessageDiv.classList.contains('alert-success')) {
+                if (!mikrotikErrorMessageDiv.classList.contains('alert-success')) {
                     connectButton.disabled = false;
                     connectButton.innerHTML = originalButtonHTML;
                 }
             });
         });
+
+        // Initialize translations on page load
+        document.addEventListener('DOMContentLoaded', fetchTranslations);
     </script>
 </body>
 </html>

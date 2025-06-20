@@ -3,6 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="csrf-token" content="{{ csrf_token() }}">
     <title>Hotspot Manager v2</title>
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.1.1/css/all.min.css" rel="stylesheet">
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
@@ -706,12 +707,33 @@ async function init() {
 // --- API & Data Loading ---
 async function apiCall(endpoint, options = {}) {
     showGlobalSpinner(true);
-    try {
-        const response = await fetch(`${API_BASE_URL}/api${endpoint}`, {
-            headers: { 'Content-Type': 'application/json' }, // We expect to send JSON
-            ...options
-        });
 
+    // Prepare headers
+    const headers = {
+        'Content-Type': 'application/json', // Default content type
+        ...options.headers // Spread any headers passed in options
+    };
+
+    // Add CSRF token for relevant methods
+    const httpMethod = options.method ? options.method.toUpperCase() : 'GET';
+    if (['POST', 'PUT', 'DELETE', 'PATCH'].includes(httpMethod)) {
+        const csrfToken = document.querySelector('meta[name="csrf-token"]').getAttribute('content');
+        if (csrfToken) {
+            headers['X-CSRFToken'] = csrfToken;
+        } else {
+            console.warn('CSRF token not found in meta tag. Requests that modify state might fail.');
+            // Optionally, you could prevent the request here or show an immediate error.
+        }
+    }
+
+    // Update options with potentially modified headers
+    const fetchOptions = {
+        ...options,
+        headers: headers
+    };
+
+    try {
+        const response = await fetch(`${API_BASE_URL}/api${endpoint}`, fetchOptions);
         const contentType = response.headers.get("content-type");
         
         if (!response.ok) {
@@ -754,94 +776,240 @@ async function apiCall(endpoint, options = {}) {
     }
 }
 
-async function checkConnection() {
+async function checkConnection(isInitialLoad = false) {
     const statusEl = document.getElementById('connectionStatus');
-    const result = await apiCall('/test-connection', { method: 'POST' }); // apiCall shows global spinner
+    // Do not show global spinner for the initial, automatic checkConnection call.
+    // Only show for manual calls (e.g. from Test button in settings).
+    // The apiCall function itself handles the spinner, so we need a way to tell it.
+    // For now, assume apiCall's spinner is acceptable, or adjust apiCall to accept a noSpinner option.
+    // Let's assume the spinner shown by apiCall is fine for now.
+    const result = await apiCall('/test-connection', { method: 'POST' });
 
+    let isConnected = false;
     if (result && result.success) {
         statusEl.className = 'connected';
         statusEl.innerHTML = `<i class="fas fa-check-circle"></i><span> ${result.message}</span>`;
-        
-        // Ensure globalAlert is hidden if it was previously shown for a connection error
-        // (though this scenario is less likely now with upfront login)
-        const globalAlert = document.getElementById('globalAlert');
-        if (globalAlert.textContent.includes("Could not connect")) { // More generic check
-            globalAlert.style.display = 'none';
-        }
+        isConnected = true;
+        // Hide any persistent "go to settings" message if connection is now good.
+        const persistentMessage = document.getElementById('persistentConnectionMessage');
+        if (persistentMessage) persistentMessage.style.display = 'none';
+
     } else {
         statusEl.className = 'disconnected';
-        const failureMessage = result ? result.message : 'Connection test failed. Router might be unreachable.';
+        const failureMessage = result ? result.message : getTranslation('Connection test failed. Router might be unreachable.');
         statusEl.innerHTML = `<i class="fas fa-exclamation-triangle"></i><span> ${failureMessage}</span>`;
-        // No longer navigate to settings or show a prominent global alert here.
-        // The before_request hook will handle persistent connection issues by redirecting to login.
-        // A subtle update to connectionStatus is sufficient if testConnection is manually clicked
-        // or if init() runs and somehow the connection dropped since login.
+
+        // Show a persistent message guiding to Settings, only if not already on settings page.
+        if (document.getElementById('settings') && !document.getElementById('settings').classList.contains('active')) {
+            showPersistentConnectionMessage(`Mikrotik router not connected. Please <a href="#" onclick="navigateToTab('settings'); return false;">configure settings</a>.`);
+        }
+        isConnected = false;
+    }
+    updateUIAfterConnectionCheck(isConnected, isInitialLoad);
+}
+
+function showPersistentConnectionMessage(message) {
+    let msgDiv = document.getElementById('persistentConnectionMessage');
+    if (!msgDiv) {
+        msgDiv = document.createElement('div');
+        msgDiv.id = 'persistentConnectionMessage';
+        msgDiv.className = 'alert alert-warning'; // Use warning style
+        msgDiv.style.marginTop = '1rem';
+        msgDiv.style.textAlign = 'center';
+        // Insert it after page-header
+        const pageHeader = document.querySelector('.page-header');
+        if (pageHeader && pageHeader.parentNode) {
+            pageHeader.parentNode.insertBefore(msgDiv, pageHeader.nextSibling);
+        } else { // Fallback if page-header is not found
+            document.querySelector('.main-content').prepend(msgDiv);
+        }
+    }
+    msgDiv.innerHTML = message;
+    msgDiv.style.display = 'block';
+}
+
+function updateUIAfterConnectionCheck(isConnected, isInitialLoad = false) {
+    // Selectors for elements to disable/enable
+    // This list might need to be expanded based on UI elements that interact with Mikrotik
+    const mikrotikDependentElements = [
+        // User Tab
+        '#userSearchInput', '#userFilterProfile', '#userFilterStatus',
+        ...document.querySelectorAll('#usersTable button'), // Refresh, edit, delete user buttons
+        ...document.querySelectorAll('#users .panel-header button'), // Refresh button in user list
+        ...document.querySelectorAll('#users .btn-success, #users .btn-primary, #users .btn-danger'), // Export buttons
+
+        // Create Tab forms and buttons
+        '#createUserForm input', '#createUserForm select', '#createUserForm button',
+        '#bulkCreateUserForm input', '#bulkCreateUserForm select', '#bulkCreateUserForm button',
+        '#exportVouchersHTMLButton', '#exportVouchersPDFButton',
+
+        // Active Sessions Tab
+        ...document.querySelectorAll('#sessionsTable button'), // Disconnect buttons
+        ...document.querySelectorAll('#sessions .panel-header button'), // Refresh button
+
+        // Analytics Tab
+        '#refreshAnalyticsButton', // Refresh button for analytics
+
+        // Maintenance Tab (excluding profile management if some actions are local)
+        // Profiles might be manageable (view cached) even if offline, but add/edit/delete needs connection.
+        // For simplicity, disabling all profile table actions and add button.
+        ...document.querySelectorAll('#profilesTable button'), // Edit, delete profile
+        ...document.querySelectorAll('#maintenance .panel:nth-child(1) .btn-success'), // Add profile button
+        ...document.querySelectorAll('#maintenance .panel:nth-child(2) .btn-danger'), // Delete expired users
+        ...document.querySelectorAll('#maintenance .panel:nth-child(3) .btn-danger'), // Delete by profile
+        ...document.querySelectorAll('#maintenance .panel:nth-child(4) .btn-danger'), // Delete by status
+
+        // Settings tab - Router connection part. Test button should be enabled. Save can be enabled.
+        // '#configForm input', // Keep these enabled for user to fill
+        // '#configForm button[type="submit"]', // Save button in settings
+        // Test button in settings should always be enabled:
+        // document.querySelector('#configForm button[onclick="testConnection()"]').disabled = false;
+    ];
+
+    mikrotikDependentElements.forEach(selector => {
+        if (typeof selector === 'string') {
+            const element = document.querySelector(selector);
+            if (element) element.disabled = !isConnected;
+        } else { // If it's already an element (from querySelectorAll)
+            selector.disabled = !isConnected;
+        }
+    });
+
+    // Special handling for elements that should always be enabled or based on other conditions
+    document.querySelector('#configForm button[onclick="testConnection()"]').disabled = false; // Always enable test button
+    document.querySelector('#configForm button[type="submit"]').disabled = false; // Always enable save config button
+
+    // If not connected and it's the initial load, clear dynamic data areas
+    // or show "not connected" messages.
+    if (!isConnected && isInitialLoad) {
+        document.getElementById('totalUsers').textContent = '-';
+        document.getElementById('activeSessions').textContent = '-';
+        document.querySelector('#usersTable tbody').innerHTML = `<tr><td colspan="9" style="text-align:center;">${getTranslation('Not connected to Mikrotik router.')}</td></tr>`;
+        document.querySelector('#sessionsTable tbody').innerHTML = `<tr><td colspan="7" style="text-align:center;">${getTranslation('Not connected to Mikrotik router.')}</td></tr>`;
+        document.querySelector('#profilesTable tbody').innerHTML = `<tr><td colspan="5" style="text-align:center;">${getTranslation('Not connected to Mikrotik router.')}</td></tr>`;
+        const analyticsTotalDataEl = document.getElementById('analyticsTotalData');
+        if (analyticsTotalDataEl) analyticsTotalDataEl.textContent = getTranslation('Total Data Transferred: Not Connected');
+        // Clear charts or show placeholder
+        if (profileUsageChartInstance) profileUsageChartInstance.destroy();
+        if (topUsersChartInstance) topUsersChartInstance.destroy();
+         // Analytics specific message
+        const profileCtx = document.getElementById('profileUsageChart').getContext('2d');
+        const topUsersCtx = document.getElementById('topUsersChart').getContext('2d');
+        profileCtx.clearRect(0,0,profileCtx.canvas.width, profileCtx.canvas.height); // Clear canvas
+        topUsersCtx.clearRect(0,0,topUsersCtx.canvas.width, topUsersCtx.canvas.height); // Clear canvas
+        // Optionally, draw a "Not Connected" message on canvas
     }
 }
 
+
 async function loadDashboardStats() {
     const data = await apiCall('/dashboard-stats');
-    if (data) {
-        document.getElementById('totalUsers').textContent = data.total_users;
-        document.getElementById('activeSessions').textContent = data.active_sessions;
+    if (data) { // apiCall returns null on connection error to Mikrotik via service layer
+        document.getElementById('totalUsers').textContent = data.total_users !== undefined ? data.total_users : '-';
+        document.getElementById('activeSessions').textContent = data.active_sessions !== undefined ? data.active_sessions : '-';
+    } else {
+        // If data is null (likely Mikrotik connection issue), ensure UI reflects this
+        document.getElementById('totalUsers').textContent = '-';
+        document.getElementById('activeSessions').textContent = '-';
+        // A more specific message might be set by checkConnection's UI update
     }
 }
 
 async function loadUsers(silent = false) {
     const tbody = document.querySelector('#usersTable tbody');
-    if (!silent) tbody.innerHTML = `<tr><td colspan="9" style="text-align:center;"><div class="loading-spinner"></div></td></tr>`;
+    if (!document.querySelector('#connectionStatus').classList.contains('connected') && !silent) {
+        tbody.innerHTML = `<tr><td colspan="9" style="text-align:center;">${getTranslation('Not connected to Mikrotik router. Cannot load users.')} <a href="#" onclick="navigateToTab('settings'); return false;">Configure Settings</a>.</td></tr>`;
+        return;
+    }
+    if (!silent) tbody.innerHTML = `<tr><td colspan="9" style="text-align:center;"><div class="loading-spinner"></div> ${getTranslation('Loading users...')}</td></tr>`;
+
     const data = await apiCall('/users');
     if (data && data.users) {
         currentUsers = data.users;
-        filterAndDisplayUsers();
-    } else {
-        tbody.innerHTML = `<tr><td colspan="9" style="text-align:center;">Could not load users.</td></tr>`;
+        filterAndDisplayUsers(); // This will show "No users match criteria" if empty after filter
+        if (currentUsers.length === 0 && !document.getElementById('userSearchInput').value && !document.getElementById('userFilterProfile').value && !document.getElementById('userFilterStatus').value) {
+             tbody.innerHTML = `<tr><td colspan="9" style="text-align:center;">${getTranslation('No users found on the router.')}</td></tr>`;
+        }
+    } else if (data === null && document.querySelector('#connectionStatus').classList.contains('connected')) {
+        // Data is null but connection status was 'connected' - implies an issue during API call not related to initial connection
+        tbody.innerHTML = `<tr><td colspan="9" style="text-align:center;">${getTranslation('Error loading users. Please try again.')}</td></tr>`;
+    } else if (!document.querySelector('#connectionStatus').classList.contains('connected')) {
+        // If not connected, filterAndDisplayUsers might not be called or might show "no users match"
+        // Ensure a clear message about connection is shown if users couldn't be loaded due to it.
+        // This is partly redundant with the check at the start of the function.
+        tbody.innerHTML = `<tr><td colspan="9" style="text-align:center;">${getTranslation('Not connected to Mikrotik router. Cannot load users.')}</td></tr>`;
     }
+    // If data is not null but data.users is missing, it's an unexpected response.
+    // The general error from apiCall might cover this, or a specific message here.
 }
 
+
 async function loadProfiles() {
+    const profilesSelects = [
+        '#profile', '#bulkProfile', '#editProfile',
+        '#userFilterProfile', '#exportProfileFilter', '#deleteByProfileSelect'
+    ];
+    if (!document.querySelector('#connectionStatus').classList.contains('connected')) {
+        document.querySelector('#profilesTable tbody').innerHTML = `<tr><td colspan="5" style="text-align:center;">${getTranslation('Not connected to Mikrotik router. Cannot load profiles.')} <a href="#" onclick="navigateToTab('settings'); return false;">Configure Settings</a>.</td></tr>`;
+        // Clear profile dropdowns or set a "not connected" option
+        profilesSelects.forEach(selId => {
+            const select = document.querySelector(selId);
+            if (select) {
+                const defaultOptionKey = (selId === '#userFilterProfile' || selId === '#exportProfileFilter' || selId === '#deleteByProfileSelect') ?
+                                         (selId === '#deleteByProfileSelect' ? '-- Select Profile --' : 'All Profiles')
+                                         : 'Select Profile';
+                select.innerHTML = `<option value="">${getTranslation(defaultOptionKey)}</option><option value="" disabled>${getTranslation('Not Connected')}</option>`;
+            }
+        });
+        currentProfiles = []; // Ensure currentProfiles is empty
+        displayProfiles(); // Update table display (will show "not connected")
+        return;
+    }
+
     const data = await apiCall('/profiles');
     if (data && data.profiles) {
         currentProfiles = data.profiles;
-        // Populate all profile dropdowns
-        const profileSelects = [
-            { id: '#profile', defaultText: 'Select Profile' },
-            { id: '#bulkProfile', defaultText: 'Select Profile' },
-            { id: '#editProfile', defaultText: 'Select Profile' },
+        const profileSelectConfigs = [
+            { id: '#profile', defaultTextKey: 'Select Profile' },
+            { id: '#bulkProfile', defaultTextKey: 'Select Profile' },
+            { id: '#editProfile', defaultTextKey: 'Select Profile' },
             { id: '#userFilterProfile', defaultTextKey: 'All Profiles' },
             { id: '#exportProfileFilter', defaultTextKey: 'All Profiles' },
             { id: '#deleteByProfileSelect', defaultTextKey: '-- Select Profile --'}
         ];
-        profileSelects.forEach(selConfig => {
+        profileSelectConfigs.forEach(selConfig => {
             const select = document.querySelector(selConfig.id);
             if(select) {
-                const currentVal = select.value; // Preserve current selection if any
+                const currentVal = select.value;
                 select.innerHTML = `<option value="">${getTranslation(selConfig.defaultTextKey)}</option>`;
                 currentProfiles.forEach(p => select.add(new Option(p.name, p.name)));
-                if(currentVal) select.value = currentVal; // Restore selection
+                if(currentVal && currentProfiles.some(p => p.name === currentVal)) select.value = currentVal;
+                else select.value = ""; // Reset if previous value not in new list
             }
         });
-        displayProfiles(); // This updates the profiles table in Maintenance tab
+        displayProfiles();
+    } else {
+        // Handle case where data is null (connection issue) or data.profiles is missing
+        document.querySelector('#profilesTable tbody').innerHTML = `<tr><td colspan="5" style="text-align:center;">${getTranslation('Could not load profiles.')}</td></tr>`;
+        currentProfiles = []; // Ensure currentProfiles is empty
+        displayProfiles(); // Update table display (will show "no profiles found")
     }
 }
 
 function setupDeleteByStatusDropdown() {
     const select = document.getElementById('deleteByStatusSelect');
-    if (select) {
+    if (select) { // Ensure this select is populated with translated options
+        const currentVal = select.value;
         select.innerHTML = `
             <option value="">${getTranslation('-- Select Status --')}</option>
             <option value="active">${getTranslation('Active Users')}</option>
             <option value="disabled">${getTranslation('Disabled Users')}</option>
         `;
+        if(currentVal) select.value = currentVal; // Preserve selection if valid
     }
 }
 
 function updateStaticTranslatedText() {
-    // Example: Update page title or other static elements if needed
-    // This function can be expanded to update any static text content set in HTML
-    // For now, most elements are dynamically rendered or have their text set by other functions.
-    // Let's ensure button texts are updated if they were static HTML and not part of a component.
-    // The Maintenance tab buttons are static in HTML:
     const deleteByProfileButton = document.getElementById('deleteByProfileButton');
     if (deleteByProfileButton) {
         deleteByProfileButton.innerHTML = `<i class="fas fa-trash-alt"></i> ${getTranslation('Delete Users by Profile')}`;
@@ -863,35 +1031,49 @@ function updateStaticTranslatedText() {
     
     // Update panel headers in Maintenance tab for the new sections
     // This requires finding them more robustly if more panels are added.
-    // Assuming they are the 3rd and 4th panels in the maintenance tab for now.
     const maintenanceTab = document.getElementById('maintenance');
     if (maintenanceTab) {
         const panels = maintenanceTab.querySelectorAll('.panel');
-        if (panels.length > 2 && panels[2].querySelector('h3')) { // Delete by Profile panel
+        // Update "Delete Users by Profile" panel header
+        if (panels.length > 2 && panels[2].querySelector('h3')) {
             panels[2].querySelector('h3').textContent = getTranslation('Delete Users by Profile');
         }
-        if (panels.length > 3 && panels[3].querySelector('h3')) { // Delete by Status panel
+        // Update "Delete Users by Active Status" panel header
+        if (panels.length > 3 && panels[3].querySelector('h3')) {
             panels[3].querySelector('h3').textContent = getTranslation('Delete Users by Active Status');
         }
     }
+     // Ensure other static texts are also updated if any were missed by dynamic updates
+     // e.g. sidebar items, modal titles (though they are often set dynamically)
+    document.querySelectorAll('.sidebar-nav a span').forEach(span => {
+        const key = span.parentElement.dataset.tab; // Assuming tab name can serve as a key or part of it
+        if(key){ // Example: if tab 'dashboard' has span 'Dashboard'
+             const translatedText = getTranslation(span.textContent); // Try to translate existing text
+             if(translatedText !== span.textContent) span.textContent = translatedText;
+        }
+    });
+    // Page title is set dynamically on tab change, so no need to update it here.
 }
 
-
-// This function can be called from init() if there are more elements
-// that are purely static in the HTML and need their text content updated on load.
 function setupStaticTranslations() {
-    // Example: if any other static text needs updating
-    // document.getElementById('someStaticElement').textContent = getTranslation('someStaticElementKey');
-    // For now, specific updates are in updateStaticTranslatedText after translations are loaded.
+    // This function is called before translations are loaded.
+    // Its purpose would be to set up elements if they depended on structure, not text.
+    // Text updates should happen in updateStaticTranslatedText AFTER translations are loaded.
 }
 
 async function loadActiveSessions() {
-    const data = await apiCall('/active-sessions');
     const tbody = document.querySelector('#sessionsTable tbody');
+    if (!document.querySelector('#connectionStatus').classList.contains('connected')) {
+        tbody.innerHTML = `<tr><td colspan="7" style="text-align:center;">${getTranslation('Not connected to Mikrotik router. Cannot load sessions.')} <a href="#" onclick="navigateToTab('settings'); return false;">Configure Settings</a>.</td></tr>`;
+        return;
+    }
+    tbody.innerHTML = `<tr><td colspan="7" style="text-align:center;"><div class="loading-spinner"></div> ${getTranslation('Loading sessions...')}</td></tr>`;
+
+    const data = await apiCall('/active-sessions');
     if (data && data.sessions) {
         currentSessions = data.sessions;
         if (currentSessions.length === 0) {
-            tbody.innerHTML = `<tr><td colspan="7" style="text-align:center;">No active sessions found.</td></tr>`;
+            tbody.innerHTML = `<tr><td colspan="7" style="text-align:center;">${getTranslation('No active sessions found.')}</td></tr>`;
             return;
         }
         tbody.innerHTML = currentSessions.map(s => `
@@ -901,16 +1083,16 @@ async function loadActiveSessions() {
                 <td>${s['mac-address'] || ''}</td>
                 <td>${s.uptime || ''}</td>
                 <td>${formatBytes(s['bytes-in'])} / ${formatBytes(s['bytes-out'])}</td>
-                <td>${s['session-time-left'] || 'Unlimited'}</td>
+                <td>${s['session-time-left'] || getTranslation('Unlimited')}</td>
                 <td>
                     <button class="btn btn-danger btn-sm" onclick="disconnectUser('${s['.id']}')">
-                        <i class="fas fa-times"></i> Disconnect
+                        <i class="fas fa-times"></i> ${getTranslation('Disconnect')}
                     </button>
                 </td>
             </tr>
         `).join('');
     } else {
-        tbody.innerHTML = `<tr><td colspan="7" style="text-align:center;">Could not load sessions.</td></tr>`;
+         tbody.innerHTML = `<tr><td colspan="7" style="text-align:center;">${getTranslation('Could not load sessions.')}</td></tr>`;
     }
 }
 
