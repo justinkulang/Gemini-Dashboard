@@ -1,5 +1,6 @@
 """Mikrotik Hotspot User Management Backend - v2
 Major overhaul with a redesigned UI, profile management, filtered exports, QR codes, and more."""
+# import traceback # Removed as no longer needed after debug log removal
 from flask import Flask, render_template, request, jsonify, send_from_directory, g, redirect, url_for, session # Add session
 from flask_cors import CORS
 from flask_babel import Babel, get_locale, _ # Re-add get_locale
@@ -74,7 +75,10 @@ SECRET_KEY_FALLBACK = "a_very_secret_and_stable_key_for_development_do_not_use_i
 app.config['SECRET_KEY'] = os.environ.get('FLASK_SECRET_KEY', SECRET_KEY_FALLBACK)
 if app.config['SECRET_KEY'] == SECRET_KEY_FALLBACK:
     logger.warning("WARNING: FLASK_SECRET_KEY environment variable not set. Using a default, insecure key for development. SET THIS VARIABLE IN PRODUCTION!")
-app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(minutes=30) # Set to 30 minutes session timeout
+app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(hours=8) # Increased for testing
+app.config['REMEMBER_COOKIE_DURATION'] = timedelta(days=7)   # Explicitly set remember_me duration
+app.config['REMEMBER_COOKIE_HTTPONLY'] = True
+app.config['REMEMBER_COOKIE_SAMESITE'] = 'Lax' 
 
 # Initialize Flask-Login
 login_manager = LoginManager()
@@ -129,9 +133,10 @@ class ConfigLoader:
                 "host": "0.0.0.0",
                 "port": 5000,
                 "debug": False,
-                "log_file": "mikrotik_dashboard.log",
-                "log_level_console": "INFO",
-                "log_level_file": "INFO"
+                "log_file": "mikrotik_dashboard.log", 
+                "log_level_console": "INFO", 
+                "log_level_file": "INFO",
+                "router_callback_api_key": "DEFAULT_KEY_CHANGE_ME_NOW" # Add API key here
             },
             "app_admin": {
                 "username": "admin",
@@ -146,13 +151,13 @@ class ConfigLoader:
                 # For mikrotik and server, update the default_config's sections with loaded values
                 default_config['mikrotik'].update(loaded_config.get('mikrotik', {}))
                 default_config['server'].update(loaded_config.get('server', {}))
-
+                
                 # For app_admin, ensure it exists in default_config then update it
                 # This handles cases where app_admin might not be in an old config file
                 if 'app_admin' not in default_config: # Should not happen given the new default_config structure
                     default_config['app_admin'] = {}
                 default_config['app_admin'].update(loaded_config.get('app_admin', {}))
-
+                
                 return default_config
         else:
             # If config file doesn't exist, write the full default_config (including new app_admin)
@@ -164,8 +169,99 @@ class ConfigLoader:
         return self.config
 
     def update_config(self, new_config):
-        self.config['mikrotik'].update(new_config.get('mikrotik', {}))
-        self.config['server'].update(new_config.get('server', {}))
+        # Mikrotik config update
+        if 'mikrotik' in new_config:
+            current_mikrotik_config = self.config.get('mikrotik', {})
+            form_mikrotik_config = new_config['mikrotik'] # Data from the settings form
+
+            # Fields to update if new value is non-empty string
+            string_fields = ['host', 'username', 'hotspot_login_url']
+            for field in string_fields:
+                if field in form_mikrotik_config and form_mikrotik_config[field] != "": # Only update if not empty
+                    current_mikrotik_config[field] = form_mikrotik_config[field]
+                elif field not in current_mikrotik_config: # Ensure field exists if it was missing
+                     current_mikrotik_config[field] = "" 
+
+
+            # Port: update if valid integer
+            if 'port' in form_mikrotik_config:
+                try:
+                    new_port = form_mikrotik_config.get('port')
+                    if isinstance(new_port, str) and new_port.strip() == "":
+                        # If port is an empty string, explicitly do not change current_mikrotik_config['port']
+                        # This means "no change" or "use existing".
+                        pass
+                    else:
+                        current_mikrotik_config['port'] = int(new_port)
+                except (ValueError, TypeError):
+                    # Keep existing port if new one is invalid, and log an error
+                    logger.warning(f"Invalid port value received for Mikrotik config: {form_mikrotik_config.get('port')}. Keeping existing port.")
+            elif 'port' not in current_mikrotik_config: # Ensure port field exists
+                current_mikrotik_config['port'] = 8728 # Default port
+
+            # Password: only update if new password is non-empty
+            if 'password' in form_mikrotik_config and form_mikrotik_config['password']: # Check if not None and not empty
+                current_mikrotik_config['password'] = form_mikrotik_config['password']
+            # DO NOT clear password if field is empty, as form might send empty if not changed
+
+            # SSL: update if present (it's a boolean from checkbox/JS)
+            if 'use_ssl' in form_mikrotik_config: 
+                current_mikrotik_config['use_ssl'] = bool(form_mikrotik_config['use_ssl'])
+            elif 'use_ssl' not in current_mikrotik_config: # Ensure field exists
+                current_mikrotik_config['use_ssl'] = False
+
+
+            self.config['mikrotik'] = current_mikrotik_config
+        
+        # Server config update
+        if 'server' in new_config:
+            current_server_config = self.config.get('server', {})
+            form_server_config = new_config['server']
+
+            if 'host' in form_server_config and form_server_config['host'] != "":
+                current_server_config['host'] = form_server_config['host']
+            elif 'host' not in current_server_config:
+                 current_server_config['host'] = "0.0.0.0" 
+
+            if 'port' in form_server_config:
+                try:
+                    new_server_port = form_server_config.get('port')
+                    if isinstance(new_server_port, str) and new_server_port.strip() == "":
+                        pass # No change if empty string
+                    else:
+                        current_server_config['port'] = int(new_server_port)
+                except (ValueError, TypeError):
+                    logger.warning(f"Invalid server port value: {form_server_config.get('port')}. Keeping existing.")
+                    if 'port' not in current_server_config: current_server_config['port'] = 5000
+            elif 'port' not in current_server_config:
+                 current_server_config['port'] = 5000
+
+            if 'debug' in form_server_config: # Debug is boolean
+                 current_server_config['debug'] = bool(form_server_config['debug'])
+            elif 'debug' not in current_server_config:
+                 current_server_config['debug'] = False
+
+            # router_callback_api_key: update if non-empty
+            if 'router_callback_api_key' in form_server_config and form_server_config['router_callback_api_key']:
+                current_server_config['router_callback_api_key'] = form_server_config['router_callback_api_key']
+            elif 'router_callback_api_key' not in current_server_config:
+                 current_server_config['router_callback_api_key'] = "DEFAULT_KEY_CHANGE_ME_NOW"
+            
+            # Log file and levels
+            string_fields_server = ['log_file', 'log_level_console', 'log_level_file']
+            for field in string_fields_server:
+                if field in form_server_config and form_server_config[field] != "":
+                    current_server_config[field] = form_server_config[field]
+                elif field not in current_server_config: # Ensure field exists with default if it was missing
+                    if field == 'log_file': current_server_config[field] = "mikrotik_dashboard.log"
+                    if field == 'log_level_console': current_server_config[field] = "INFO"
+                    if field == 'log_level_file': current_server_config[field] = "INFO"
+
+            self.config['server'] = current_server_config
+
+        # app_admin section is NOT updated here to protect password hash.
+        # It should be handled by a dedicated password change mechanism.
+
         with open(self.config_file, 'w') as f:
             json.dump(self.config, f, indent=4)
 
@@ -307,7 +403,7 @@ def add_time_bank_user(username: str, total_allotted_seconds: int, profile_befor
     """Adds or replaces a user in the time bank."""
     with get_db_connection() as conn:
         conn.execute("""
-            INSERT OR REPLACE INTO user_time_bank
+            INSERT OR REPLACE INTO user_time_bank 
             (username, total_allotted_seconds, profile_before_pause, cumulative_used_seconds, is_paused, last_seen_active, created_at, updated_at)
             VALUES (?, ?, ?, 0, 0, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
         """, (username, total_allotted_seconds, profile_before_pause, datetime.now(timezone.utc).isoformat()))
@@ -326,7 +422,7 @@ def update_time_bank_user_usage(username: str, session_uptime_seconds: int):
     """Updates a user's cumulative used seconds and last_seen_active."""
     with get_db_connection() as conn:
         conn.execute("""
-            UPDATE user_time_bank
+            UPDATE user_time_bank 
             SET cumulative_used_seconds = cumulative_used_seconds + ?,
                 last_seen_active = ?
             WHERE username = ?
@@ -339,14 +435,14 @@ def set_time_bank_user_pause_status(username: str, is_paused: bool, profile_name
     with get_db_connection() as conn:
         if is_paused:
             conn.execute("""
-                UPDATE user_time_bank
+                UPDATE user_time_bank 
                 SET is_paused = 1, profile_before_pause = ?, last_seen_active = ?
                 WHERE username = ?
             """, (profile_name, datetime.now(timezone.utc).isoformat(), username))
             logger.info(f"User {username} paused. Profile before pause: {profile_name}")
         else:
             conn.execute("""
-                UPDATE user_time_bank
+                UPDATE user_time_bank 
                 SET is_paused = 0, last_seen_active = ?
                 WHERE username = ?
             """, (datetime.now(timezone.utc).isoformat(), username))
@@ -364,7 +460,7 @@ def set_time_bank_cumulative_usage(username: str, total_used_seconds: int):
     """Sets a user's cumulative used seconds to a specific value and updates last_seen_active."""
     with get_db_connection() as conn:
         conn.execute("""
-            UPDATE user_time_bank
+            UPDATE user_time_bank 
             SET cumulative_used_seconds = ?,
                 last_seen_active = ?
             WHERE username = ?
@@ -375,6 +471,53 @@ def set_time_bank_cumulative_usage(username: str, total_used_seconds: int):
 # Call DB initialization after app_config is loaded and logging is set up.
 init_sqlite_db()
 
+# Check for default API key after config is loaded and log warning
+if app_config.get('server', {}).get('router_callback_api_key') == "DEFAULT_KEY_CHANGE_ME_NOW":
+    logger.critical("="*70)
+    logger.critical("WARNING: Default 'router_callback_api_key' is in use ('DEFAULT_KEY_CHANGE_ME_NOW').")
+    logger.critical("This is INSECURE. Please change it in your config.json file.")
+    logger.critical("The /api/internal/record-session-end endpoint WILL NOT FUNCTION until this is changed.")
+    logger.critical("="*70)
+    # Optionally, you could disable the endpoint here or have it return an error
+    # if the default key is used, but a log warning is a good first step.
+
+# --- Helper for Self-Service API Authentication ---
+def _verify_hotspot_user_session(username: str, client_ip: str, client_mac: str) -> bool:
+    """
+    Verifies if a hotspot user has an active session matching the given IP and MAC.
+    Returns True if a matching active session is found, False otherwise.
+    """
+    api = get_mikrotik_api()
+    if not api:
+        logger.warning("_verify_hotspot_user_session: Mikrotik API not available.")
+        return False
+    try:
+        # Normalize MAC address to upper case with colons if needed, as Mikrotik stores it this way.
+        # Example: aa-bb-cc-dd-ee-ff -> AA:BB:CC:DD:EE:FF
+        # For now, assume client_mac is already in the expected Mikrotik format (uppercase, colon-separated)
+        # or that Mikrotik's query is flexible. Best to ensure format consistency.
+        # Let's assume direct match for now, but this might need adjustment.
+        # A more robust solution would be to fetch all active sessions for the user and check IP/MAC.
+        
+        # Query based on all three: user, address, and mac-address
+        # Mikrotik API query syntax:
+        # .where(user=username, address=client_ip, mac_address=client_mac.upper())
+        # Note: field name in API is 'mac-address'
+        
+        sessions = list(api.path('/ip/hotspot/active').select('.id').where(user=username, address=client_ip, **{'mac-address': client_mac.upper()}))
+        
+        if sessions:
+            logger.info(f"_verify_hotspot_user_session: Active session found for user {username} with IP {client_ip} and MAC {client_mac}.")
+            return True
+        else:
+            logger.info(f"_verify_hotspot_user_session: No active session found for user {username} with IP {client_ip} and MAC {client_mac}.")
+            return False
+    except librouteros.exceptions.LibRouterosError as e:
+        logger.error(f"_verify_hotspot_user_session: RouterOS API error for user {username}, IP {client_ip}, MAC {client_mac}: {e}", exc_info=True)
+        return False
+    except Exception as e:
+        logger.error(f"_verify_hotspot_user_session: Unexpected error for user {username}, IP {client_ip}, MAC {client_mac}: {e}", exc_info=True)
+        return False
 
 # --- User Class for Flask-Login ---
 class User(UserMixin):
@@ -383,6 +526,7 @@ class User(UserMixin):
 
     @staticmethod
     def get(user_id):
+        # This method is simple and doesn't require specific debug logging beyond what Flask-Login might provide.
         admin_username = app_config.get('app_admin', {}).get('username')
         if user_id == admin_username:
             return User(user_id)
@@ -390,7 +534,12 @@ class User(UserMixin):
 
 @login_manager.user_loader
 def load_user(user_id):
+    # This function is critical for Flask-Login.
+    # Standard logging for user loading (e.g., "User X loaded") can be kept if desired,
+    # but verbose session-specific debug logs are removed.
     user = User.get(user_id)
+    # Example of a standard log that might be kept:
+    # logger.debug(f"load_user: Attempting to load user with id '{user_id}'. User found: {user is not None}")
     return user
 
 # Define exempt endpoints that do not require a Mikrotik connection OR app login initially
@@ -404,12 +553,16 @@ def before_request_handler():
     logger.debug(f"before_request: endpoint='{request.endpoint}', path='{request.path}'")
 
     # 1. Flask-Login Authentication Check
-    login_exempt_for_auth = request.endpoint in ['login_page', 'app_login_route', 'static', 'get_translations']
+    # Endpoint 'record_session_end' is API key protected, not by Flask-Login session.
+    login_exempt_for_auth_check = request.endpoint in ['login_page', 'app_login_route', 'static', 'get_translations', 'record_session_end'] 
+    
+    # Standard debug log for all requests, can be helpful.
+    logger.debug(f"before_request: endpoint='{request.endpoint}', authenticated={current_user.is_authenticated}")
 
-    # Removed temporary debug logging from here
-
-    if not login_exempt_for_auth and not current_user.is_authenticated:
-        logger.info(f"User not authenticated for endpoint '{request.endpoint}'. Redirecting to login page.")
+    if not login_exempt_for_auth_check and not current_user.is_authenticated:
+        # More concise logging for unauthenticated access attempts to protected routes.
+        logger.info(f"Unauthenticated access to protected endpoint '{request.endpoint}'. Redirecting to login. Session _user_id: {session.get('_user_id')}")
+        # The more detailed session dump previously here was for specific debugging and is now removed.
         return redirect(url_for('login_page'))
 
     # 2. Mikrotik Connection Initialization (for authenticated users on non-exempt routes)
@@ -433,8 +586,9 @@ def before_request_handler():
 @app.route('/api/logout', methods=['POST'])
 @login_required
 def logout():
+    # logger.critical("CRITICAL: /api/logout route CALLED.") # Removed critical log
     global app_config
-    logger.info("Processing logout request.")
+    logger.info("Processing logout request.") # Standard info log
 
     # Logout from Flask-Login session
     logout_user()
@@ -469,7 +623,7 @@ def pause_user_time_route(username: str):
     time_bank_user = get_time_bank_user(username)
     if not time_bank_user:
         return jsonify({'success': False, 'message': _('User not found in time bank or not eligible for time banking.')}), 404
-
+    
     if time_bank_user['is_paused']:
         return jsonify({'success': False, 'message': _('User is already paused.')}), 400
 
@@ -479,9 +633,9 @@ def pause_user_time_route(username: str):
         if not mikrotik_users:
             return jsonify({'success': False, 'message': _('User not found on Mikrotik router.')}), 404
         mikrotik_user_details = mikrotik_users[0]
-
+        
         current_mikrotik_uptime_seconds = parse_ros_time_to_seconds(mikrotik_user_details.get('uptime', '0s'))
-
+        
         # Sync cumulative used time with Mikrotik's total user uptime *before* pausing
         set_time_bank_cumulative_usage(username, current_mikrotik_uptime_seconds)
         logger.info(f"User {username}'s cumulative_used_seconds synced to {current_mikrotik_uptime_seconds}s from Mikrotik total uptime before pausing.")
@@ -502,7 +656,7 @@ def pause_user_time_route(username: str):
 
         # Disable user on Mikrotik
         # (Using 'true' as a string, as per Mikrotik API conventions for boolean-like fields)
-        edit_success, edit_msg = router_os_service.edit_hotspot_user(username, {'disabled': 'true'})
+        edit_success, edit_msg = router_os_service.edit_hotspot_user(username, {'disabled': 'true'}) 
         if not edit_success:
             # Potentially revert DB changes or log inconsistency if critical
             logger.error(f"Failed to disable user {username} on Mikrotik during pause: {edit_msg}")
@@ -510,7 +664,7 @@ def pause_user_time_route(username: str):
             # but this could lead to inconsistency if user can still log in.
             # A more robust solution might involve a rollback or retry mechanism.
             return jsonify({'success': False, 'message': _("User paused in local DB, but failed to disable on Mikrotik: {error}").format(error=edit_msg)}), 500
-
+            
         return jsonify({'success': True, 'message': _('User {username} paused successfully. Uptime recorded, user disconnected and disabled.').format(username=username)})
 
     except Exception as e:
@@ -528,13 +682,13 @@ def resume_user_time_route(username: str):
     time_bank_user = get_time_bank_user(username)
     if not time_bank_user:
         return jsonify({'success': False, 'message': _('User not found in time bank or not eligible for time banking.')}), 404
-
+    
     if not time_bank_user['is_paused']:
         return jsonify({'success': False, 'message': _('User is not currently paused.')}), 400
 
     try:
         remaining_seconds = time_bank_user['total_allotted_seconds'] - time_bank_user['cumulative_used_seconds']
-
+        
         if remaining_seconds <= 0:
             # User has no time left. Keep them disabled on Mikrotik.
             # Optionally, delete from Mikrotik if profile_before_pause was 'delete_when_depleted' or similar.
@@ -545,7 +699,7 @@ def resume_user_time_route(username: str):
             return jsonify({'success': False, 'message': _('User {username} has no time remaining. Cannot resume.').format(username=username)}), 400
 
         ros_remaining_time = format_seconds_to_ros_time(remaining_seconds)
-
+        
         # Update user on Mikrotik: set new limit-uptime and re-enable
         # Consider restoring original profile if it was changed, or manage via a specific "paused" profile.
         # For this implementation, we assume the user might have been in a 'paused' profile or just disabled.
@@ -558,14 +712,14 @@ def resume_user_time_route(username: str):
 
 
         edit_success, edit_msg = router_os_service.edit_hotspot_user(username, update_payload)
-
+        
         if not edit_success:
             logger.error(f"Failed to update user {username} on Mikrotik during resume: {edit_msg}")
             return jsonify({'success': False, 'message': _("Failed to update user on Mikrotik: {error}").format(error=edit_msg)}), 500
-
+            
         # Update local DB
         set_time_bank_user_pause_status(username, False) # This also updates updated_at
-
+        
         logger.info(f"User {username} resumed with {ros_remaining_time} remaining. Profile set to {update_payload.get('profile')}.")
         return jsonify({'success': True, 'message': _('User {username} resumed successfully with {time} remaining.').format(username=username, time=ros_remaining_time)})
 
@@ -841,7 +995,8 @@ def get_mikrotik_api():
         # Fetch the latest config directly from the loader instance for new connections
         current_loaded_config = config_loader.get_config() 
         mikrotik_config = current_loaded_config['mikrotik']
-        logger.debug(f"get_mikrotik_api: Using host from config_loader.get_config(): {mikrotik_config.get('host')}")
+        # logger.info(f"get_mikrotik_api: Full Mikrotik config being used for new connection: {mikrotik_config}") # Removed specific debug log
+        logger.debug(f"get_mikrotik_api: Using host from config_loader.get_config(): {mikrotik_config.get('host')}") # Existing debug log, can stay
         
         host, port, username, password, use_ssl = (
             mikrotik_config['host'], mikrotik_config['port'],
@@ -1059,7 +1214,7 @@ class RouterOSService:
                 return False, "Mikrotik connection not available", 0
             
             users = self.get_hotspot_users() 
-            if not users and api is None:
+            if not users and api is None: 
                  return False, "Mikrotik connection not available (users fetch failed)", 0
 
             deleted_count = 0
@@ -1298,7 +1453,8 @@ def app_login_route():
         user = User.get(username)
         if user:
             login_user(user, remember=True, duration=app.config['PERMANENT_SESSION_LIFETIME'])
-            logger.info(f"User '{username}' logged in successfully to the web application.")
+            session.permanent = True # Explicitly make session permanent
+            logger.info(f"User '{username}' logged in successfully to the web application. Session made permanent.")
             return jsonify({'success': True, 'message': _('Web app login successful.')})
         else: # Should not happen if User.get is consistent
             logger.error(f"User.get failed for '{username}' after successful credential check.")
@@ -1358,8 +1514,10 @@ def initial_connect():
             "use_ssl": app_config['mikrotik'].get('use_ssl', False), # Preserve existing SSL setting
             "hotspot_login_url": app_config['mikrotik'].get('hotspot_login_url', '') # Preserve existing
         }
+        # logger.info(f"/api/initial-connect: Attempting to save new Mikrotik config: {new_mikrotik_config}") # Removed specific debug log
         config_loader.update_config({'mikrotik': new_mikrotik_config})
         app_config = config_loader.get_config() # Reload app_config to reflect changes
+        # logger.info(f"/api/initial-connect: app_config reloaded after update, Mikrotik section: {app_config.get('mikrotik')}") # Removed specific debug log
 
         return jsonify({'success': True, 'message': 'Successfully connected and configuration saved.'})
 
@@ -1475,7 +1633,7 @@ def create_user():
                 logger.warning(f"Time banking enabled for user {username} but limit-uptime '{limit_uptime}' is zero or invalid.")
         else:
             logger.warning(f"Time banking enabled for user {username} but no limit-uptime was provided.")
-
+            
     return jsonify({'success': success, 'message': message})
 
 @app.route('/api/bulk-create-users', methods=['POST'])
@@ -1588,10 +1746,10 @@ def disconnect_user_session(active_id: str):
     try:
         # Fetch active session details to get username
         active_sessions = list(api.path('ip', 'hotspot', 'active').select('user').where('.id', active_id))
-
+        
         if not active_sessions:
             return jsonify({'success': False, 'message': _('Active session not found.')}), 404
-
+        
         active_session_details = active_sessions[0]
         username = active_session_details.get('user')
 
@@ -1606,7 +1764,7 @@ def disconnect_user_session(active_id: str):
                     mikrotik_user_details = mikrotik_users[0]
                     total_mikrotik_uptime_str = mikrotik_user_details.get('uptime', '0s')
                     total_mikrotik_uptime_seconds = parse_ros_time_to_seconds(total_mikrotik_uptime_str)
-
+                    
                     set_time_bank_cumulative_usage(username, total_mikrotik_uptime_seconds)
                     logger.info(f"Synced cumulative usage for '{username}' to {total_mikrotik_uptime_seconds}s before disconnecting session.")
                 else:
@@ -1621,11 +1779,11 @@ def disconnect_user_session(active_id: str):
         # Proceed with disconnecting the user session via the service
         # The router_os_service.disconnect_user itself calls get_mikrotik_api, which is fine.
         success, message = router_os_service.disconnect_user(active_id)
-
+        
         if success:
             # Optionally, refresh dashboard stats if a session was removed.
             # This might be too much for just a disconnect, depending on desired UI responsiveness.
-            # await loadDashboardStats()
+            # await loadDashboardStats() 
             pass
 
         return jsonify({'success': success, 'message': message})
@@ -1649,9 +1807,9 @@ def delete_users_by_profile_route(profile_name: str):
     try:
         # Need to fetch users of this profile first to get their names for time bank deletion
         users_in_profile = [u for u in router_os_service.get_hotspot_users() if u.get('profile') == profile_name]
-
+        
         success, message, deleted_count = router_os_service.delete_users_by_profile(profile_name)
-
+        
         if success and deleted_count > 0:
             for user in users_in_profile: # Iterate over the fetched list
                 delete_time_bank_user(user['name'])
@@ -1659,7 +1817,7 @@ def delete_users_by_profile_route(profile_name: str):
         elif success and deleted_count == 0:
              logger.info(f"No users found for profile '{profile_name}' on Mikrotik, no changes to time bank.")
         # If not success, router_os_service.delete_users_by_profile would have logged the error.
-
+        
         return jsonify({'success': success, 'message': message, 'deleted_count': deleted_count})
     except Exception as e:
         logger.error(f"Error in delete_users_by_profile_route for profile '{profile_name}': {str(e)}", exc_info=True)
@@ -1686,7 +1844,7 @@ def delete_users_by_active_status_route(status: str):
         users_with_status = [u for u in router_os_service.get_hotspot_users() if u.get('disabled') == target_status_str]
 
         success, message, deleted_count = router_os_service.delete_users_by_active_status(is_disabled)
-
+        
         if success and deleted_count > 0:
             for user in users_with_status:
                 delete_time_bank_user(user['name'])
@@ -1936,6 +2094,260 @@ def get_translations():
 
     }
     return jsonify(translations)
+
+# --- Hotspot User Self-Service API Endpoints ---
+
+@app.route('/api/hotspot/self-service/status', methods=['GET'])
+@csrf.exempt # Exempt from CSRF protection
+def hotspot_self_service_status():
+    username = request.args.get('username')
+    client_ip = request.args.get('ip')
+    client_mac = request.args.get('mac')
+
+    if not all([username, client_ip, client_mac]):
+        return jsonify({'success': False, 'message': _('Missing required parameters (username, ip, mac).')}), 400
+
+    # Authenticate based on active session
+    if not _verify_hotspot_user_session(username, client_ip, client_mac):
+        return jsonify({'success': False, 'message': _('Unauthorized: No active session found matching your details.')}), 403
+
+    time_bank_user = get_time_bank_user(username)
+    if not time_bank_user:
+        return jsonify({
+            'success': True, # Successfully checked, but user is not time-banked
+            'is_time_banked': False,
+            'message': _('User is not managed by the time bank system.')
+        })
+
+    return jsonify({
+        'success': True,
+        'is_time_banked': True,
+        'username': username,
+        'total_allotted_seconds': time_bank_user['total_allotted_seconds'],
+        'cumulative_used_seconds': time_bank_user['cumulative_used_seconds'],
+        'remaining_seconds': time_bank_user['total_allotted_seconds'] - time_bank_user['cumulative_used_seconds'],
+        'is_paused': bool(time_bank_user['is_paused'])
+    })
+
+@app.route('/api/hotspot/self-service/pause', methods=['POST'])
+@csrf.exempt # Exempt from CSRF protection
+def hotspot_self_service_pause():
+    data = request.json
+    username = data.get('username')
+    client_ip = data.get('ip')
+    client_mac = data.get('mac')
+
+    if not all([username, client_ip, client_mac]):
+        return jsonify({'success': False, 'message': _('Missing required parameters (username, ip, mac).')}), 400
+
+    # Authenticate based on active session
+    if not _verify_hotspot_user_session(username, client_ip, client_mac):
+        return jsonify({'success': False, 'message': _('Unauthorized: No active session found matching your details.')}), 403
+
+    api = get_mikrotik_api()
+    if not api:
+        return jsonify({'success': False, 'message': _('Mikrotik connection not available.')}), 503
+
+    time_bank_user = get_time_bank_user(username)
+    if not time_bank_user:
+        return jsonify({'success': False, 'message': _('User is not managed by the time bank system.')}), 404
+    if bool(time_bank_user['is_paused']):
+        return jsonify({'success': False, 'message': _('User session is already paused.')}), 400
+
+    try:
+        # Fetch total user uptime from Mikrotik /ip/hotspot/user
+        mikrotik_users = list(api.path('ip', 'hotspot', 'user').select('uptime', 'profile').where(name=username))
+        if not mikrotik_users:
+            # This should ideally not happen if _verify_hotspot_user_session passed,
+            # as it implies the user exists.
+            logger.error(f"Self-service pause: User {username} passed session verification but not found in /ip/hotspot/user.")
+            return jsonify({'success': False, 'message': _('User not found on router for uptime sync.')}), 404
+        
+        mikrotik_user_details = mikrotik_users[0]
+        current_mikrotik_uptime_seconds = parse_ros_time_to_seconds(mikrotik_user_details.get('uptime', '0s'))
+        original_profile = mikrotik_user_details.get('profile')
+
+        # Sync cumulative used time with Mikrotik's total user uptime
+        set_time_bank_cumulative_usage(username, current_mikrotik_uptime_seconds)
+        logger.info(f"Self-service pause: User {username}'s cumulative_used_seconds synced to {current_mikrotik_uptime_seconds}s.")
+
+        # Set pause status in local DB (stores original profile if not already stored, which is fine)
+        set_time_bank_user_pause_status(username, True, original_profile)
+
+        # Disconnect all active sessions for the user
+        # Re-fetch active sessions specifically for this user to get their .id(s)
+        user_active_sessions = list(api.path('ip', 'hotspot', 'active').select('.id').where(user=username))
+        disconnected_count = 0
+        for session in user_active_sessions:
+            try:
+                api.path('ip', 'hotspot', 'active').remove(session['.id'])
+                disconnected_count += 1
+            except Exception as e_disconnect:
+                logger.error(f"Self-service pause: Error disconnecting session {session['.id']} for user {username}: {e_disconnect}")
+        logger.info(f"Self-service pause: Disconnected {disconnected_count} active session(s) for user {username}.")
+        
+        # Disable user on Mikrotik
+        edit_success, edit_msg = router_os_service.edit_hotspot_user(username, {'disabled': 'true'})
+        if not edit_success:
+            # This is problematic. User is paused locally, but still active on router.
+            # For self-service, it's safer to inform user of failure.
+            # Admin might need to intervene.
+            logger.error(f"Self-service pause: Failed to disable user {username} on Mikrotik: {edit_msg}")
+            # Attempt to unpause locally to reflect reality? Or leave as is for admin to check?
+            # For now, let's return an error and log it.
+            return jsonify({'success': False, 'message': _("Session paused locally, but failed to disable on router: {error}").format(error=edit_msg)}), 500
+            
+        return jsonify({'success': True, 'message': _('User session paused successfully.')})
+
+    except librouteros.exceptions.LibRouterosError as e:
+        logger.error(f"Self-service pause: RouterOS API error for user {username}: {e}", exc_info=True)
+        return jsonify({'success': False, 'message': _("Router communication error: {error}").format(error=str(e))}), 500
+    except Exception as e:
+        logger.error(f"Self-service pause: Unexpected error for user {username}: {e}", exc_info=True)
+        return jsonify({'success': False, 'message': _('An unexpected server error occurred while pausing.')}), 500
+
+@app.route('/api/hotspot/self-service/resume', methods=['POST'])
+@csrf.exempt # Exempt from CSRF protection
+def hotspot_self_service_resume():
+    data = request.json
+    username = data.get('username')
+    client_ip = data.get('ip') # Received, but not strictly used for auth in this simplified version
+    client_mac = data.get('mac') # Received, but not strictly used for auth
+
+    if not all([username, client_ip, client_mac]): # Basic check for presence
+        return jsonify({'success': False, 'message': _('Missing required parameters (username, ip, mac).')}), 400
+
+    api = get_mikrotik_api()
+    if not api:
+        return jsonify({'success': False, 'message': _('Mikrotik connection not available.')}), 503
+
+    time_bank_user = get_time_bank_user(username)
+    if not time_bank_user:
+        return jsonify({'success': False, 'message': _('User is not managed by the time bank system.')}), 404
+    if not bool(time_bank_user['is_paused']):
+        return jsonify({'success': False, 'message': _('User session is not currently paused.')}), 400
+
+    try:
+        remaining_seconds = time_bank_user['total_allotted_seconds'] - time_bank_user['cumulative_used_seconds']
+        if remaining_seconds <= 0:
+            # Ensure user remains disabled on Mikrotik if they have no time.
+            # router_os_service.edit_hotspot_user(username, {'disabled': 'true'}) # This is likely already true.
+            # Update local DB to reflect they are no longer administratively paused but depleted.
+            set_time_bank_user_pause_status(username, False) 
+            logger.info(f"Self-service resume: User {username} has no time remaining. Remains disabled.")
+            return jsonify({'success': False, 'message': _('No time remaining. Cannot resume session.')}), 400
+
+        ros_remaining_time = format_seconds_to_ros_time(remaining_seconds)
+        
+        update_payload = {
+            'limit-uptime': ros_remaining_time,
+            'disabled': 'false'
+        }
+        if time_bank_user.get('profile_before_pause'):
+            update_payload['profile'] = time_bank_user['profile_before_pause']
+        else:
+            # Fallback: if no profile_before_pause is stored, what should we do?
+            # Option 1: Fetch current profile from Mikrotik user (it might be a 'paused' profile)
+            # and if it's a 'paused' profile, try to revert to a default one.
+            # Option 2: Log a warning and don't set profile, hoping it's acceptable.
+            # For now, let's go with not setting profile if not stored.
+            logger.warning(f"Self-service resume: No 'profile_before_pause' stored for user {username}. Resuming without changing profile.")
+
+
+        edit_success, edit_msg = router_os_service.edit_hotspot_user(username, update_payload)
+        if not edit_success:
+            logger.error(f"Self-service resume: Failed to update user {username} on Mikrotik: {edit_msg}")
+            return jsonify({'success': False, 'message': _("Failed to update user on Mikrotik: {error}").format(error=edit_msg)}), 500
+            
+        # Update local DB: unpause the user
+        set_time_bank_user_pause_status(username, False)
+        
+        logger.info(f"Self-service resume: User {username} resumed with {ros_remaining_time} remaining. Profile set to {update_payload.get('profile', 'unchanged')}.")
+        return jsonify({'success': True, 'message': _('User session resumed successfully with {time} remaining.').format(time=ros_remaining_time)})
+
+    except librouteros.exceptions.LibRouterosError as e:
+        logger.error(f"Self-service resume: RouterOS API error for user {username}: {e}", exc_info=True)
+        return jsonify({'success': False, 'message': _("Router communication error: {error}").format(error=str(e))}), 500
+    except Exception as e:
+        logger.error(f"Self-service resume: Unexpected error for user {username}: {e}", exc_info=True)
+        return jsonify({'success': False, 'message': _('An unexpected server error occurred while resuming.')}), 500
+
+
+# --- RouterOS Script Callback Endpoint (for uptime sync) ---
+@app.route('/api/internal/record-session-end', methods=['POST'])
+@csrf.exempt # Exempt from CSRF protection
+# This route is NOT protected by @login_required, as it's called by the router.
+def record_session_end():
+    # 1. API Key Authentication
+    configured_api_key = app_config.get('server', {}).get('router_callback_api_key')
+    
+    # Security: Refuse to operate if the default insecure key is still configured.
+    if configured_api_key == "DEFAULT_KEY_CHANGE_ME_NOW" or not configured_api_key:
+        logger.error("record_session_end: Endpoint called but 'router_callback_api_key' is not securely configured. Request rejected.")
+        return jsonify({'success': False, 'message': 'Endpoint not configured or insecure API key in use.'}), 503 # Service Unavailable
+
+    received_api_key = request.headers.get('X-Router-Api-Key')
+    if not received_api_key:
+        logger.warning("record_session_end: Request received without X-Router-Api-Key header.")
+        return jsonify({'success': False, 'message': 'Missing API key.'}), 401
+    
+    if received_api_key != configured_api_key:
+        logger.warning(f"record_session_end: Invalid API key received. Expected: '{configured_api_key[:5]}...', Got: '{received_api_key[:5]}...'")
+        return jsonify({'success': False, 'message': 'Invalid API key.'}), 403
+
+    # 2. Input Data Processing
+    username = request.form.get('username')
+    total_uptime_ros_format = request.form.get('total_uptime_seconds') # This will be a RouterOS time string
+
+    if not username:
+        logger.warning("record_session_end: 'username' missing from request data.")
+        return jsonify({'success': False, 'message': "Missing 'username' parameter."}), 400
+    if not total_uptime_ros_format: # Check if the string itself is missing
+        logger.warning(f"record_session_end: 'total_uptime_seconds' (RouterOS time string) missing for user '{username}'.")
+        return jsonify({'success': False, 'message': "Missing 'total_uptime_seconds' parameter."}), 400
+
+    try:
+        # Parse the RouterOS time string (e.g., "1h2m3s", "300s") into seconds
+        total_uptime_seconds = parse_ros_time_to_seconds(total_uptime_ros_format)
+        # parse_ros_time_to_seconds returns 0 for empty or invalid strings, which is acceptable here.
+        # We might want to log if parsing resulted in 0 from a non-empty, non-"0s" string,
+        # but the function itself handles basic invalid formats gracefully by returning 0.
+        if total_uptime_seconds < 0: # Should not happen with parse_ros_time_to_seconds current logic
+            raise ValueError("Parsed total uptime cannot be negative.")
+            
+    except ValueError as e: # Should primarily catch the negative check if parse_ros_time_to_seconds changes
+        logger.warning(f"record_session_end: Invalid 'total_uptime_seconds' value after parsing '{total_uptime_ros_format}' for user '{username}': {e}")
+        return jsonify({'success': False, 'message': f"Invalid 'total_uptime_seconds' format: {e}"}), 400
+    except Exception as e: # Catch any other unexpected error during parsing
+        logger.error(f"record_session_end: Error parsing 'total_uptime_seconds' string '{total_uptime_ros_format}' for user '{username}': {e}", exc_info=True)
+        return jsonify({'success': False, 'message': "Error processing uptime value."}), 500
+
+
+    # 3. Action: Update Time Bank
+    logger.info(f"record_session_end: Received callback for user '{username}'. Original ROS uptime string: '{total_uptime_ros_format}', Parsed seconds: {total_uptime_seconds}.")
+    time_bank_user = get_time_bank_user(username)
+
+    if time_bank_user:
+        if bool(time_bank_user['is_paused']):
+            logger.info(f"record_session_end: User '{username}' is PAUSED. Uptime sync via callback will be skipped.")
+            # It's important not to sync uptime if the user is paused, as their 'official' usage
+            # is frozen at the point of pause. When they resume, a new limit-uptime is set.
+            # If they somehow log in while paused (e.g. admin re-enabled them on router without unpausing in app),
+            # this prevents their paused time bank from being overwritten by new usage.
+            return jsonify({'success': True, 'message': 'User is paused, uptime not updated via callback.'})
+        
+        try:
+            set_time_bank_cumulative_usage(username, total_uptime_seconds)
+            logger.info(f"record_session_end: Successfully updated cumulative uptime for user '{username}' to {total_uptime_seconds}s.")
+            return jsonify({'success': True, 'message': 'Uptime recorded successfully.'})
+        except Exception as e:
+            logger.error(f"record_session_end: Error calling set_time_bank_cumulative_usage for user '{username}': {e}", exc_info=True)
+            return jsonify({'success': False, 'message': 'Failed to update time bank due to server error.'}), 500
+    else:
+        logger.info(f"record_session_end: User '{username}' not found in time bank. No action taken.")
+        # This is not an error for the callback itself, as Mikrotik might send updates for all users.
+        return jsonify({'success': True, 'message': 'User not managed by time bank or not found.'})
+
 
 if __name__ == '__main__':
     server_config = app_config['server']
