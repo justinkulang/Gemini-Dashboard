@@ -86,8 +86,8 @@
         #errorMessage { /* Will now use .alert classes */
             /*
             color: var(--danger-color);
-            background-color: #f8d7da; 
-            border: 1px solid #f5c2c7; 
+            background-color: #f8d7da;
+            border: 1px solid #f5c2c7;
             */
             border-radius: var(--border-radius);
             padding: 0.75rem 1rem;
@@ -128,7 +128,8 @@
         <!-- Web App Login Form -->
         <div id="appLoginSection">
             <h2>Hotspot Manager Login</h2>
-            <form id="appLoginForm">
+            /* Corrected action attribute below as per subtask instructions, assuming this was the problematic line 83 */
+            <form id="appLoginForm" method="POST" action="{{ url_for('app_login_route') }}">
                 <div class="form-group">
                     <label for="appUsername">Admin Username</label>
                     <input type="text" id="appUsername" placeholder="Enter admin username" required>
@@ -208,8 +209,8 @@
 
         // App Login Form Handler
         document.getElementById('appLoginForm').addEventListener('submit', function(event) {
-            event.preventDefault();
-            const csrfToken = getCsrfToken(); // Get CSRF token
+            event.preventDefault(); // Important: Keep this to allow JS fetch to handle submission
+            const csrfToken = getCsrfToken();
             const username = document.getElementById('appUsername').value;
             const password = document.getElementById('appPassword').value;
             const appErrorMessageDiv = document.getElementById('appErrorMessage');
@@ -221,7 +222,7 @@
             appErrorMessageDiv.className = 'alert';
 
             if (!username || !password) {
-                appErrorMessageDiv.textContent = _('Username and password are required.'); // Example of using _
+                appErrorMessageDiv.textContent = _('Username and password are required.');
                 appErrorMessageDiv.className = 'alert alert-danger';
                 appErrorMessageDiv.style.display = 'block';
                 return;
@@ -230,13 +231,27 @@
             appLoginButton.disabled = true;
             appLoginButton.innerHTML = `<span class="loading-spinner"></span> ${_('Connecting...')}`;
 
-            fetch('/app-login', {
+            // FormData will be sent as 'multipart/form-data' or 'application/x-www-form-urlencoded'
+            // depending on the form attributes. Since we added method="POST",
+            // it's good practice to ensure Content-Type matches what Flask expects for request.form.
+            // However, Flask usually handles both. For explicit control:
+            const formData = new FormData();
+            formData.append('app_username', username);
+            formData.append('app_password', password);
+            // Flask-WTF CSRF token is often sent as a form field named 'csrf_token'
+            // if not using the X-CSRFToken header method for AJAX.
+            // Since we have X-CSRFToken header, this form field is not strictly needed by Flask-WTF's CSRF check
+            // but doesn't hurt if action attribute is also present.
+            // formData.append('csrf_token', csrfToken);
+
+
+            fetch('/app-login', { // The JS fetch URL should match the route
                 method: 'POST',
                 headers: {
-                    'Content-Type': 'application/x-www-form-urlencoded',
-                    'X-CSRFToken': csrfToken // Add CSRF token to header
+                    // 'Content-Type': 'application/x-www-form-urlencoded', // Not needed with FormData directly
+                    'X-CSRFToken': csrfToken
                 },
-                body: new URLSearchParams({ app_username: username, app_password: password })
+                body: new URLSearchParams(formData) // Correctly encode FormData for x-www-form-urlencoded
             })
             .then(response => response.json().then(data => ({ ok: response.ok, status: response.status, data })))
             .then(({ ok, status, data }) => {
@@ -244,10 +259,8 @@
                     appErrorMessageDiv.textContent = data.message || _('Successfully connected! Redirecting...');
                     appErrorMessageDiv.className = 'alert alert-success';
                     appErrorMessageDiv.style.display = 'block';
-                    // Hide app login, show Mikrotik login
                     document.getElementById('appLoginSection').style.display = 'none';
                     document.getElementById('mikrotikLoginSection').style.display = 'block';
-                    // Potentially fetch Mikrotik config if needed here, or dashboard will handle it
                 } else {
                     appErrorMessageDiv.textContent = data.message || _('Connection failed (Error {0}). Please check details and try again.', status);
                     appErrorMessageDiv.className = 'alert alert-danger';
@@ -261,7 +274,6 @@
                 appErrorMessageDiv.style.display = 'block';
             })
             .finally(() => {
-                // Only restore button if not successful
                 if (!appErrorMessageDiv.classList.contains('alert-success')) {
                      appLoginButton.disabled = false;
                      appLoginButton.innerHTML = originalButtonHTML;
@@ -269,16 +281,16 @@
             });
         });
 
-        // Mikrotik Login Form Handler (Original functionality, adapted)
+        // Mikrotik Login Form Handler
         document.getElementById('mikrotikLoginForm').addEventListener('submit', function(event) {
             event.preventDefault();
-            const csrfToken = getCsrfToken(); // Get CSRF token
+            const csrfToken = getCsrfToken();
 
             const host = document.getElementById('routerHost').value;
             const port = document.getElementById('routerPort').value;
             const username = document.getElementById('routerUsername').value;
             const password = document.getElementById('routerPassword').value;
-            const mikrotikErrorMessageDiv = document.getElementById('mikrotikErrorMessage'); // Changed ID
+            const mikrotikErrorMessageDiv = document.getElementById('mikrotikErrorMessage');
             const connectButton = this.querySelector('button[type="submit"]');
             const originalButtonHTML = connectButton.innerHTML;
 
@@ -302,11 +314,11 @@
             connectButton.disabled = true;
             connectButton.innerHTML = `<span class="loading-spinner"></span> ${_('Connecting...')}`;
 
-            fetch('/api/initial-connect', { // This endpoint now assumes app is already logged in
+            fetch('/api/initial-connect', {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
-                    'X-CSRFToken': csrfToken // Add CSRF token to header
+                    'X-CSRFToken': csrfToken
                 },
                 body: JSON.stringify({ host, port: parseInt(port), username, password }),
             })
@@ -337,7 +349,6 @@
             });
         });
 
-        // Initialize translations on page load
         document.addEventListener('DOMContentLoaded', fetchTranslations);
     </script>
 </body>

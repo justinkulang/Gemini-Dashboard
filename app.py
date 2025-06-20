@@ -974,7 +974,7 @@ def login_page():
     # The CSRF token is implicitly available via csrf_token() in templates,
     # or can be generated via generate_csrf() and passed to render_template.
     # For now, we assume JS will fetch it or have it available (see login.html modifications).
-    return send_from_directory(get_base_path(), 'login.html')
+    return render_template('login.html')
 
 
 @app.route('/app-login', methods=['POST'])
@@ -1012,7 +1012,7 @@ def app_login_route():
 @login_required # Protect this route
 def index():
     """Serves the main dashboard page."""
-    return send_from_directory(get_base_path(), 'mikrotik_userman_dashboard.html')
+    return render_template('mikrotik_userman_dashboard.html')
 
 @app.route('/api/initial-connect', methods=['POST'])
 # No @login_required here, as it's for the Mikrotik connection setup,
