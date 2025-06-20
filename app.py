@@ -6,9 +6,10 @@ from flask_babel import Babel, get_locale, _ # Re-add get_locale
 from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
 from flask_wtf.csrf import CSRFProtect, generate_csrf # Import CSRFProtect and generate_csrf
 from werkzeug.security import generate_password_hash, check_password_hash
-from datetime import timedelta
+from datetime import timedelta, datetime, timezone
 import librouteros
 from librouteros.exceptions import TrapError
+import sqlite3
 import socket
 import json
 import os
@@ -29,6 +30,9 @@ import base64
 # --- Logging Configuration ---
 logger = logging.getLogger(__name__) # Get logger for the app
 # Note: Actual handler configuration will be done after app_config is loaded.
+
+# --- Database Configuration ---
+DATABASE_FILE = 'timebank.db'
 
 # --- Graceful Dependency Handling ---
 # Attempt to import WeasyPrint for PDF export
@@ -70,7 +74,7 @@ SECRET_KEY_FALLBACK = "a_very_secret_and_stable_key_for_development_do_not_use_i
 app.config['SECRET_KEY'] = os.environ.get('FLASK_SECRET_KEY', SECRET_KEY_FALLBACK)
 if app.config['SECRET_KEY'] == SECRET_KEY_FALLBACK:
     logger.warning("WARNING: FLASK_SECRET_KEY environment variable not set. Using a default, insecure key for development. SET THIS VARIABLE IN PRODUCTION!")
-app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(minutes=30) # Example: 30 minutes timeout
+app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(minutes=30) # Set to 30 minutes session timeout
 
 # Initialize Flask-Login
 login_manager = LoginManager()
@@ -242,6 +246,135 @@ def setup_logging(app_config_instance):
 
 setup_logging(app_config) # Call the setup function with the loaded app_config
 
+# --- Utility Functions for Time Parsing ---
+def parse_ros_time_to_seconds(time_str: str) -> int:
+    """Parses RouterOS time string (e.g., 1w2d3h4m5s) into seconds."""
+    if not time_str:
+        return 0
+    total_seconds = 0
+    matches = re.findall(r'(\d+)([wdhms])', time_str)
+    for value, unit in matches:
+        value = int(value)
+        if unit == 'w': total_seconds += value * 604800
+        elif unit == 'd': total_seconds += value * 86400
+        elif unit == 'h': total_seconds += value * 3600
+        elif unit == 'm': total_seconds += value * 60
+        elif unit == 's': total_seconds += value
+    return total_seconds
+
+def format_seconds_to_ros_time(seconds: int) -> str:
+    """Converts seconds to a simple RouterOS time string (e.g., 3600s)."""
+    if seconds <= 0:
+        return "0s"
+    return f"{seconds}s"
+
+# --- Database Setup and Helpers ---
+def get_db_connection():
+    """Establishes and returns a new SQLite connection with row_factory set."""
+    conn = sqlite3.connect(DATABASE_FILE)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_sqlite_db():
+    """Initializes the SQLite database and creates the user_time_bank table if it doesn't exist."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS user_time_bank (
+                username TEXT PRIMARY KEY,
+                total_allotted_seconds INTEGER NOT NULL,
+                cumulative_used_seconds INTEGER NOT NULL DEFAULT 0,
+                is_paused BOOLEAN NOT NULL DEFAULT 0 CHECK (is_paused IN (0, 1)),
+                profile_before_pause TEXT,
+                last_seen_active DATETIME,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        # Trigger to update 'updated_at' timestamp
+        cursor.execute("""
+            CREATE TRIGGER IF NOT EXISTS update_user_time_bank_updated_at
+            AFTER UPDATE ON user_time_bank
+            FOR EACH ROW
+            BEGIN
+                UPDATE user_time_bank SET updated_at = CURRENT_TIMESTAMP WHERE username = OLD.username;
+            END;
+        """)
+        conn.commit()
+    logger.info(f"Database '{DATABASE_FILE}' initialized successfully.")
+
+def add_time_bank_user(username: str, total_allotted_seconds: int, profile_before_pause: str = None):
+    """Adds or replaces a user in the time bank."""
+    with get_db_connection() as conn:
+        conn.execute("""
+            INSERT OR REPLACE INTO user_time_bank
+            (username, total_allotted_seconds, profile_before_pause, cumulative_used_seconds, is_paused, last_seen_active, created_at, updated_at)
+            VALUES (?, ?, ?, 0, 0, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        """, (username, total_allotted_seconds, profile_before_pause, datetime.now(timezone.utc).isoformat()))
+        conn.commit()
+    logger.info(f"User {username} added/updated in time bank with {total_allotted_seconds}s.")
+
+def get_time_bank_user(username: str):
+    """Fetches a user's time bank record."""
+    with get_db_connection() as conn:
+        user_row = conn.execute("SELECT * FROM user_time_bank WHERE username = ?", (username,)).fetchone()
+    if user_row:
+        return dict(user_row)
+    return None
+
+def update_time_bank_user_usage(username: str, session_uptime_seconds: int):
+    """Updates a user's cumulative used seconds and last_seen_active."""
+    with get_db_connection() as conn:
+        conn.execute("""
+            UPDATE user_time_bank
+            SET cumulative_used_seconds = cumulative_used_seconds + ?,
+                last_seen_active = ?
+            WHERE username = ?
+        """, (session_uptime_seconds, datetime.now(timezone.utc).isoformat(), username))
+        conn.commit()
+    logger.info(f"Updated usage for user {username}: added {session_uptime_seconds}s.")
+
+def set_time_bank_user_pause_status(username: str, is_paused: bool, profile_name: str = None):
+    """Sets the pause status for a user and records their profile if pausing."""
+    with get_db_connection() as conn:
+        if is_paused:
+            conn.execute("""
+                UPDATE user_time_bank
+                SET is_paused = 1, profile_before_pause = ?, last_seen_active = ?
+                WHERE username = ?
+            """, (profile_name, datetime.now(timezone.utc).isoformat(), username))
+            logger.info(f"User {username} paused. Profile before pause: {profile_name}")
+        else:
+            conn.execute("""
+                UPDATE user_time_bank
+                SET is_paused = 0, last_seen_active = ?
+                WHERE username = ?
+            """, (datetime.now(timezone.utc).isoformat(), username))
+            logger.info(f"User {username} unpaused.")
+        conn.commit()
+
+def delete_time_bank_user(username: str):
+    """Deletes a user's record from the time bank."""
+    with get_db_connection() as conn:
+        conn.execute("DELETE FROM user_time_bank WHERE username = ?", (username,))
+        conn.commit()
+    logger.info(f"User {username} deleted from time bank.")
+
+def set_time_bank_cumulative_usage(username: str, total_used_seconds: int):
+    """Sets a user's cumulative used seconds to a specific value and updates last_seen_active."""
+    with get_db_connection() as conn:
+        conn.execute("""
+            UPDATE user_time_bank
+            SET cumulative_used_seconds = ?,
+                last_seen_active = ?
+            WHERE username = ?
+        """, (total_used_seconds, datetime.now(timezone.utc).isoformat(), username))
+        conn.commit()
+    logger.info(f"Set cumulative usage for user {username} to {total_used_seconds}s.")
+
+# Call DB initialization after app_config is loaded and logging is set up.
+init_sqlite_db()
+
 
 # --- User Class for Flask-Login ---
 class User(UserMixin):
@@ -324,6 +457,121 @@ def logout():
 
     logger.info("User logged out from web app, Mikrotik configuration reset to defaults.")
     return jsonify({'success': True, 'message': _('Logged out successfully from web app and Mikrotik.')})
+
+@app.route('/api/users/<username>/pause-time', methods=['POST'])
+@login_required
+def pause_user_time_route(username: str):
+    """Pauses a time-banked user's session and disables their Mikrotik account."""
+    api = get_mikrotik_api()
+    if not api:
+        return jsonify({'success': False, 'message': _('Mikrotik connection not available.')}), 503
+
+    time_bank_user = get_time_bank_user(username)
+    if not time_bank_user:
+        return jsonify({'success': False, 'message': _('User not found in time bank or not eligible for time banking.')}), 404
+
+    if time_bank_user['is_paused']:
+        return jsonify({'success': False, 'message': _('User is already paused.')}), 400
+
+    try:
+        # Fetch full Mikrotik user details
+        mikrotik_users = list(api.path('ip', 'hotspot', 'user').select('name', 'uptime', 'profile', 'disabled', 'limit-uptime').where(name=username))
+        if not mikrotik_users:
+            return jsonify({'success': False, 'message': _('User not found on Mikrotik router.')}), 404
+        mikrotik_user_details = mikrotik_users[0]
+
+        current_mikrotik_uptime_seconds = parse_ros_time_to_seconds(mikrotik_user_details.get('uptime', '0s'))
+
+        # Sync cumulative used time with Mikrotik's total user uptime *before* pausing
+        set_time_bank_cumulative_usage(username, current_mikrotik_uptime_seconds)
+        logger.info(f"User {username}'s cumulative_used_seconds synced to {current_mikrotik_uptime_seconds}s from Mikrotik total uptime before pausing.")
+
+        # Set pause status in local DB (this also updates 'last_seen_active')
+        set_time_bank_user_pause_status(username, True, mikrotik_user_details.get('profile'))
+        # Note: set_time_bank_user_pause_status also updates last_seen_active, which is fine.
+
+        # Disconnect active sessions
+        active_sessions = router_os_service.get_active_sessions() # Uses its own API get
+        disconnected_count = 0
+        for session in active_sessions:
+            if session.get('user') == username:
+                disconnect_success, _ = router_os_service.disconnect_user(session['.id'])
+                if disconnect_success:
+                    disconnected_count +=1
+        logger.info(f"Disconnected {disconnected_count} active session(s) for user {username}.")
+
+        # Disable user on Mikrotik
+        # (Using 'true' as a string, as per Mikrotik API conventions for boolean-like fields)
+        edit_success, edit_msg = router_os_service.edit_hotspot_user(username, {'disabled': 'true'})
+        if not edit_success:
+            # Potentially revert DB changes or log inconsistency if critical
+            logger.error(f"Failed to disable user {username} on Mikrotik during pause: {edit_msg}")
+            # For now, we proceed with DB changes even if Mikrotik edit fails, to reflect intent
+            # but this could lead to inconsistency if user can still log in.
+            # A more robust solution might involve a rollback or retry mechanism.
+            return jsonify({'success': False, 'message': _("User paused in local DB, but failed to disable on Mikrotik: {error}").format(error=edit_msg)}), 500
+
+        return jsonify({'success': True, 'message': _('User {username} paused successfully. Uptime recorded, user disconnected and disabled.').format(username=username)})
+
+    except Exception as e:
+        logger.error(f"Error pausing user {username}: {e}", exc_info=True)
+        return jsonify({'success': False, 'message': _('An unexpected error occurred while pausing the user.')}), 500
+
+@app.route('/api/users/<username>/resume-time', methods=['POST'])
+@login_required
+def resume_user_time_route(username: str):
+    """Resumes a time-banked user's session and re-enables their Mikrotik account with remaining time."""
+    api = get_mikrotik_api()
+    if not api:
+        return jsonify({'success': False, 'message': _('Mikrotik connection not available.')}), 503
+
+    time_bank_user = get_time_bank_user(username)
+    if not time_bank_user:
+        return jsonify({'success': False, 'message': _('User not found in time bank or not eligible for time banking.')}), 404
+
+    if not time_bank_user['is_paused']:
+        return jsonify({'success': False, 'message': _('User is not currently paused.')}), 400
+
+    try:
+        remaining_seconds = time_bank_user['total_allotted_seconds'] - time_bank_user['cumulative_used_seconds']
+
+        if remaining_seconds <= 0:
+            # User has no time left. Keep them disabled on Mikrotik.
+            # Optionally, delete from Mikrotik if profile_before_pause was 'delete_when_depleted' or similar.
+            # For now, just inform and keep disabled.
+            # Ensure local DB state is 'paused = false' as they are not actively paused by admin anymore, but depleted.
+            set_time_bank_user_pause_status(username, False) # Mark as not admin-paused
+            logger.info(f"User {username} has no time remaining. They remain disabled on Mikrotik.")
+            return jsonify({'success': False, 'message': _('User {username} has no time remaining. Cannot resume.').format(username=username)}), 400
+
+        ros_remaining_time = format_seconds_to_ros_time(remaining_seconds)
+
+        # Update user on Mikrotik: set new limit-uptime and re-enable
+        # Consider restoring original profile if it was changed, or manage via a specific "paused" profile.
+        # For this implementation, we assume the user might have been in a 'paused' profile or just disabled.
+        # We re-enable them and set their remaining limit-uptime.
+        # If profile_before_pause was stored, it could be restored here too.
+        # For now, we just re-enable and set uptime.
+        update_payload = {'limit-uptime': ros_remaining_time, 'disabled': 'false'}
+        if time_bank_user.get('profile_before_pause'):
+             update_payload['profile'] = time_bank_user.get('profile_before_pause')
+
+
+        edit_success, edit_msg = router_os_service.edit_hotspot_user(username, update_payload)
+
+        if not edit_success:
+            logger.error(f"Failed to update user {username} on Mikrotik during resume: {edit_msg}")
+            return jsonify({'success': False, 'message': _("Failed to update user on Mikrotik: {error}").format(error=edit_msg)}), 500
+
+        # Update local DB
+        set_time_bank_user_pause_status(username, False) # This also updates updated_at
+
+        logger.info(f"User {username} resumed with {ros_remaining_time} remaining. Profile set to {update_payload.get('profile')}.")
+        return jsonify({'success': True, 'message': _('User {username} resumed successfully with {time} remaining.').format(username=username, time=ros_remaining_time)})
+
+    except Exception as e:
+        logger.error(f"Error resuming user {username}: {e}", exc_info=True)
+        return jsonify({'success': False, 'message': _('An unexpected error occurred while resuming the user.')}), 500
 
 def _generate_vouchers_page_html(vouchers: list, hotspot_login_url: str, include_print_button: bool = True) -> str:
     html_parts = ["""
@@ -803,21 +1051,6 @@ class RouterOSService:
             logger.error(f"Error deleting profile: {str(e)}")
             return False, f"Mikrotik Error: {str(e)}"
     
-    def _parse_ros_time(self, time_str: str) -> int:
-        """Parses RouterOS time string (e.g., 1w2d3h4m5s) into seconds."""
-        if not time_str:
-            return 0
-        total_seconds = 0
-        matches = re.findall(r'(\d+)([wdhms])', time_str)
-        for value, unit in matches:
-            value = int(value)
-            if unit == 'w': total_seconds += value * 604800
-            elif unit == 'd': total_seconds += value * 86400
-            elif unit == 'h': total_seconds += value * 3600
-            elif unit == 'm': total_seconds += value * 60
-            elif unit == 's': total_seconds += value
-        return total_seconds
-
     def find_and_delete_expired_users(self) -> tuple[bool, str, int]:
         """Finds and deletes users who have exceeded their time or data limits."""
         try:
@@ -826,10 +1059,7 @@ class RouterOSService:
                 return False, "Mikrotik connection not available", 0
             
             users = self.get_hotspot_users() 
-            # get_hotspot_users itself will return [] if api was None, so this is safe.
-            # However, if api was None for this call but not for the initial api check,
-            # we might want to re-check. But the current pattern is one api per request.
-            if not users and api is None: # If users list is empty because api became None
+            if not users and api is None:
                  return False, "Mikrotik connection not available (users fetch failed)", 0
 
             deleted_count = 0
@@ -837,10 +1067,10 @@ class RouterOSService:
 
             for user in users:
                 is_expired = False
-                # Check time limit
+                # Check time limit (using the top-level utility function)
                 if user.get('limit-uptime') and user['limit-uptime'] != '0s':
-                    limit_sec = self._parse_ros_time(user['limit-uptime'])
-                    usage_sec = self._parse_ros_time(user.get('uptime', '0s'))
+                    limit_sec = parse_ros_time_to_seconds(user['limit-uptime'])
+                    usage_sec = parse_ros_time_to_seconds(user.get('uptime', '0s'))
                     if limit_sec > 0 and usage_sec >= limit_sec:
                         is_expired = True
 
@@ -856,6 +1086,8 @@ class RouterOSService:
                         api.path('ip', 'hotspot', 'user').remove(user['.id'])
                         deleted_count += 1
                         logger.info(f"Deleted expired user '{user['name']}'")
+                        # Also delete from time bank if they exist there
+                        delete_time_bank_user(user['name'])
                     except Exception as e:
                         errors.append(user['name'])
                         logger.error(f"Failed to delete expired user '{user['name']}': {e}")
@@ -1042,7 +1274,7 @@ def login_page():
     # The CSRF token is implicitly available via csrf_token() in templates,
     # or can be generated via generate_csrf() and passed to render_template.
     # For now, we assume JS will fetch it or have it available (see login.html modifications).
-    return render_template('login.html')
+    return render_template('login.html', app_user_authenticated=current_user.is_authenticated)
 
 
 @app.route('/app-login', methods=['POST'])
@@ -1199,7 +1431,29 @@ def get_dashboard_stats():
 @login_required
 def get_users():
     users = router_os_service.get_hotspot_users()
-    return jsonify({'users': users})
+    augmented_users = []
+    for user in users:
+        # Make a mutable copy
+        user_dict = dict(user)
+        time_bank_info = get_time_bank_user(user_dict['name'])
+        if time_bank_info:
+            user_dict['time_bank_total_allotted_seconds'] = time_bank_info['total_allotted_seconds']
+            user_dict['time_bank_cumulative_used_seconds'] = time_bank_info['cumulative_used_seconds']
+            user_dict['time_bank_is_paused'] = bool(time_bank_info['is_paused'])
+            remaining_seconds = time_bank_info['total_allotted_seconds'] - time_bank_info['cumulative_used_seconds']
+            user_dict['time_bank_remaining_seconds'] = remaining_seconds if remaining_seconds > 0 else 0
+            user_dict['time_bank_profile_before_pause'] = time_bank_info['profile_before_pause']
+            user_dict['time_bank_last_seen_active'] = time_bank_info['last_seen_active']
+        else:
+            # Add keys with null/default values if no time bank record
+            user_dict['time_bank_total_allotted_seconds'] = None
+            user_dict['time_bank_cumulative_used_seconds'] = None
+            user_dict['time_bank_is_paused'] = None
+            user_dict['time_bank_remaining_seconds'] = None
+            user_dict['time_bank_profile_before_pause'] = None
+            user_dict['time_bank_last_seen_active'] = None
+        augmented_users.append(user_dict)
+    return jsonify({'users': augmented_users})
 
 @app.route('/api/users', methods=['POST'])
 @login_required
@@ -1211,7 +1465,18 @@ def create_user():
         return jsonify({'success': False, 'message': _('Username and password are required.')}), 400
     
     success, message = router_os_service.create_hotspot_user(data)
-    return jsonify({'success': success, 'message': message}) # Assuming router_os_service returns translated messages or they are generic
+    if success and data.get('enable_time_banking'):
+        limit_uptime = data.get('limit-uptime')
+        if limit_uptime:
+            total_seconds = parse_ros_time_to_seconds(limit_uptime)
+            if total_seconds > 0:
+                add_time_bank_user(username, total_seconds)
+            else:
+                logger.warning(f"Time banking enabled for user {username} but limit-uptime '{limit_uptime}' is zero or invalid.")
+        else:
+            logger.warning(f"Time banking enabled for user {username} but no limit-uptime was provided.")
+
+    return jsonify({'success': success, 'message': message})
 
 @app.route('/api/bulk-create-users', methods=['POST'])
 @login_required
@@ -1269,6 +1534,16 @@ def bulk_create_users():
         success, msg = router_os_service.create_hotspot_user(user_data)
         if success:
             created_credentials.append({'username': username, 'password': password})
+            if data.get('enable_time_banking'): # Check the main enable_time_banking flag from request
+                limit_uptime = user_data.get('limit-uptime') # user_data contains the specific limit for this user
+                if limit_uptime:
+                    total_seconds = parse_ros_time_to_seconds(limit_uptime)
+                    if total_seconds > 0:
+                        add_time_bank_user(username, total_seconds)
+                    else:
+                        logger.warning(f"Time banking enabled for bulk user {username} but limit-uptime '{limit_uptime}' is zero or invalid.")
+                else:
+                    logger.warning(f"Time banking enabled for bulk user {username} but no limit-uptime was provided in base_user_data.")
         else:
             errors.append({'username': username, 'error': msg})
 
@@ -1293,6 +1568,8 @@ def edit_user(username: str):
 @login_required
 def delete_user(username: str):
     success, message = router_os_service.delete_hotspot_user(username)
+    if success:
+        delete_time_bank_user(username) # Delete from time bank as well
     return jsonify({'success': success, 'message': message})
 
 @app.route('/api/active-sessions', methods=['GET'])
@@ -1304,8 +1581,61 @@ def get_active_sessions_route():
 @app.route('/api/disconnect-user/<active_id>', methods=['POST'])
 @login_required
 def disconnect_user_session(active_id: str):
-    success, message = router_os_service.disconnect_user(active_id)
-    return jsonify({'success': success, 'message': message})
+    api = get_mikrotik_api()
+    if not api:
+        return jsonify({'success': False, 'message': _('Mikrotik connection not available.')}), 503
+
+    try:
+        # Fetch active session details to get username
+        active_sessions = list(api.path('ip', 'hotspot', 'active').select('user').where('.id', active_id))
+
+        if not active_sessions:
+            return jsonify({'success': False, 'message': _('Active session not found.')}), 404
+
+        active_session_details = active_sessions[0]
+        username = active_session_details.get('user')
+
+        if username:
+            logger.info(f"Disconnecting session for user '{username}' (active_id: {active_id}). Checking for time bank sync.")
+            time_bank_user = get_time_bank_user(username)
+            if time_bank_user and not time_bank_user['is_paused']:
+                logger.info(f"User '{username}' is time-banked and not paused. Syncing cumulative uptime from Mikrotik.")
+                # Fetch total user uptime from /ip/hotspot/user
+                mikrotik_users = list(api.path('ip', 'hotspot', 'user').select('uptime').where(name=username))
+                if mikrotik_users:
+                    mikrotik_user_details = mikrotik_users[0]
+                    total_mikrotik_uptime_str = mikrotik_user_details.get('uptime', '0s')
+                    total_mikrotik_uptime_seconds = parse_ros_time_to_seconds(total_mikrotik_uptime_str)
+
+                    set_time_bank_cumulative_usage(username, total_mikrotik_uptime_seconds)
+                    logger.info(f"Synced cumulative usage for '{username}' to {total_mikrotik_uptime_seconds}s before disconnecting session.")
+                else:
+                    logger.warning(f"Could not fetch total uptime for user '{username}' from Mikrotik to sync time bank.")
+            elif time_bank_user and time_bank_user['is_paused']:
+                 logger.info(f"User '{username}' is time-banked but is PAUSED. No uptime sync needed on session disconnect.")
+            else:
+                logger.info(f"User '{username}' is not time-banked or no record found. No time bank sync performed.")
+        else:
+            logger.warning(f"No username found for active_id {active_id}. Cannot sync time bank.")
+
+        # Proceed with disconnecting the user session via the service
+        # The router_os_service.disconnect_user itself calls get_mikrotik_api, which is fine.
+        success, message = router_os_service.disconnect_user(active_id)
+
+        if success:
+            # Optionally, refresh dashboard stats if a session was removed.
+            # This might be too much for just a disconnect, depending on desired UI responsiveness.
+            # await loadDashboardStats()
+            pass
+
+        return jsonify({'success': success, 'message': message})
+
+    except librouteros.exceptions.LibRouterosError as e:
+        logger.error(f"LibRouterosError while disconnecting user session {active_id}: {e}", exc_info=True)
+        return jsonify({'success': False, 'message': _("Router communication error: {error}").format(error=str(e))}), 500
+    except Exception as e:
+        logger.error(f"Unexpected error disconnecting user session {active_id}: {e}", exc_info=True)
+        return jsonify({'success': False, 'message': _('An unexpected server error occurred.')}), 500
 
 @app.route('/api/delete-expired-users', methods=['POST'])
 @login_required
@@ -1317,11 +1647,22 @@ def delete_expired_users_route():
 @login_required
 def delete_users_by_profile_route(profile_name: str):
     try:
+        # Need to fetch users of this profile first to get their names for time bank deletion
+        users_in_profile = [u for u in router_os_service.get_hotspot_users() if u.get('profile') == profile_name]
+
         success, message, deleted_count = router_os_service.delete_users_by_profile(profile_name)
-        # Assuming message from service is already i18n or generic
+
+        if success and deleted_count > 0:
+            for user in users_in_profile: # Iterate over the fetched list
+                delete_time_bank_user(user['name'])
+            logger.info(f"Deleted {deleted_count} users from time bank for profile '{profile_name}'.")
+        elif success and deleted_count == 0:
+             logger.info(f"No users found for profile '{profile_name}' on Mikrotik, no changes to time bank.")
+        # If not success, router_os_service.delete_users_by_profile would have logged the error.
+
         return jsonify({'success': success, 'message': message, 'deleted_count': deleted_count})
     except Exception as e:
-        logger.error(f"Error in delete_users_by_profile_route for profile '{profile_name}': {str(e)}")
+        logger.error(f"Error in delete_users_by_profile_route for profile '{profile_name}': {str(e)}", exc_info=True)
         user_message = _("An unexpected error occurred while deleting users by profile.")
         return jsonify({'success': False, 'message': user_message, 'deleted_count': 0}), 500
 
@@ -1340,11 +1681,25 @@ def delete_users_by_active_status_route(status: str):
             'deleted_count': 0
         }), 400
     try:
+        # Need to fetch users with this status first
+        target_status_str = 'true' if is_disabled else 'false'
+        users_with_status = [u for u in router_os_service.get_hotspot_users() if u.get('disabled') == target_status_str]
+
         success, message, deleted_count = router_os_service.delete_users_by_active_status(is_disabled)
+
+        if success and deleted_count > 0:
+            for user in users_with_status:
+                delete_time_bank_user(user['name'])
+            status_desc = "disabled" if is_disabled else "active"
+            logger.info(f"Deleted {deleted_count} {status_desc} users from time bank.")
+        elif success and deleted_count == 0:
+            status_desc = "disabled" if is_disabled else "active"
+            logger.info(f"No {status_desc} users found on Mikrotik, no changes to time bank.")
+
         return jsonify({'success': success, 'message': message, 'deleted_count': deleted_count})
     except Exception as e:
         status_desc = "disabled" if is_disabled else "active"
-        logger.error(f"Error in delete_users_by_active_status_route for {status_desc} users: {str(e)}")
+        logger.error(f"Error in delete_users_by_active_status_route for {status_desc} users: {str(e)}", exc_info=True)
         user_message = _("An unexpected error occurred while deleting users by status.")
         return jsonify({'success': False, 'message': user_message, 'deleted_count': 0}), 500
 
@@ -1567,7 +1922,17 @@ def get_translations():
         'Successfully processed users for profile {0}. Deleted {1} user(s).': _('Successfully processed users for profile {0}. Deleted {1} user(s).'),
         'Failed to delete users from profile {0}.': _('Failed to delete users from profile {0}.'),
         'Successfully processed {0} users. Deleted {1} user(s).': _('Successfully processed {0} users. Deleted {1} user(s).'),
-        'Failed to delete {0} users.': _('Failed to delete {0} users.')
+        'Failed to delete {0} users.': _('Failed to delete {0} users.'),
+
+        # Time Bank related translations
+        'Allotted Time': _('Allotted Time'),
+        'Used Time': _('Used Time'),
+        'Remaining Time': _('Remaining Time'),
+        'Time Bank Status': _('Time Bank Status'),
+        'Managed': _('Managed'), # For time-banked users who are active and have time
+        # 'Paused': _('Paused'), # Already exists from previous tasks, should be suitable
+        'Exhausted': _('Exhausted'), # For time-banked users with no time left
+        'N/A': _('N/A'), # For when time bank data is not applicable or available
 
     }
     return jsonify(translations)

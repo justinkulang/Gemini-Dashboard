@@ -109,6 +109,8 @@
         .status-badge { padding: 0.25em 0.6em; font-size: 75%; font-weight: 700; line-height: 1; text-align: center; white-space: nowrap; vertical-align: baseline; border-radius: 0.25rem; }
         .status-active { color: #fff; background-color: var(--success-color); }
         .status-disabled { color: #fff; background-color: var(--secondary-color); }
+        .status-paused { background-color: var(--warning-color); color: #333; } /* Amber/Yellow for Paused */
+        /* .status-exhausted will use .status-danger which is already defined and suitable */
         .modal {
             display: none; position: fixed; z-index: 1050; top: 0; left: 0; width: 100%; height: 100%;
             overflow: hidden; background-color: rgba(0,0,0,0.5);
@@ -232,11 +234,24 @@
                         <thead>
                             <tr>
                                 <th>Username</th><th>Profile</th><th>Status</th><th>Time Limit</th>
-                                <th>Data Limit</th><th>Uptime</th><th>Data Used</th><th>Comment</th><th>Actions</th>
+                                <th>Data Limit</th><th>Uptime</th><th>Data Used</th><th>Comment</th>
+                                <th data-translate-key="Allotted Time">Allotted Time</th>
+                                <th data-translate-key="Used Time">Used Time</th>
+                                <th data-translate-key="Remaining Time">Remaining Time</th>
+                                <th data-translate-key="Time Bank Status">Time Bank Status</th>
+                                <th>Actions</th>
                             </tr>
                         </thead>
                         <tbody>
-                            <tr><td colspan="9" style="text-align: center;">Loading users...</td></tr>
+                            <!-- Placeholder for loading -->
+                            <tr id="loadingUsersRow">
+                                <td colspan="13" style="text-align: center;" data-translate-key="Loading users...">Loading users...</td>
+                            </tr>
+                            <!-- Placeholder for no users -->
+                            <tr id="noUsersRow" style="display: none;">
+                                <td colspan="13" style="text-align: center;" data-translate-key="No users match the criteria.">No users match the criteria.</td>
+                            </tr>
+                            <!-- User rows will be dynamically inserted here by filterAndDisplayUsers -->
                         </tbody>
                     </table>
                 </div>
@@ -266,6 +281,9 @@
                         <div class="form-group"><label for="timeLimit">Time Limit</label><input type="text" id="timeLimit" placeholder="e.g., 1h30m, 30d"></div>
                         <div class="form-group"><label for="dataLimit">Data Limit (MB)</label><input type="number" id="dataLimit" placeholder="e.g., 500"></div>
                         <div class="form-group"><label for="comment">Comment</label><input type="text" id="comment"></div>
+                        <div class="form-group" style="display: flex; align-items: center; gap: 10px;">
+                            <input type="checkbox" id="enableTimeBanking" style="width: auto;"><label for="enableTimeBanking" style="margin: 0;">Enable Time Banking</label>
+                        </div>
                     </div>
                     <button type="submit" class="btn btn-primary"><i class="fas fa-plus"></i> Create User</button>
                 </form>
@@ -304,6 +322,9 @@
                                 <option value="alpha_upper">Alphabetical (Upper Case Only)</option>
                                 <option value="alpha_lower">Alphabetical (Lower Case Only)</option>
                             </select>
+                        </div>
+                        <div class="form-group" style="grid-column: span 1 / auto; display: flex; align-items: center; gap: 10px;"> <!-- Adjust grid span if needed -->
+                            <input type="checkbox" id="bulkEnableTimeBanking" style="width: auto;"><label for="bulkEnableTimeBanking" style="margin: 0;">Enable Time Banking for this Batch</label>
                         </div>
                     </div>
                     <button type="submit" class="btn btn-success"><i class="fas fa-users-cog"></i> Generate Vouchers</button>
@@ -885,7 +906,19 @@ function updateUIAfterConnectionCheck(isConnected, isInitialLoad = false) {
     if (!isConnected && isInitialLoad) {
         document.getElementById('totalUsers').textContent = '-';
         document.getElementById('activeSessions').textContent = '-';
-        document.querySelector('#usersTable tbody').innerHTML = `<tr><td colspan="9" style="text-align:center;">${getTranslation('Not connected to Mikrotik router.')}</td></tr>`;
+        // Use the placeholder rows for usersTable, ensure correct colspan
+        const usersLoadingRow = document.getElementById('loadingUsersRow');
+        const usersNoUsersRow = document.getElementById('noUsersRow');
+        if (usersLoadingRow) usersLoadingRow.style.display = 'none';
+        if (usersNoUsersRow) {
+            usersNoUsersRow.style.display = 'table-row';
+            const cell = usersNoUsersRow.querySelector('td');
+            cell.textContent = getTranslation('Not connected to Mikrotik router.');
+            cell.setAttribute('colspan', '13');
+        } else {
+            // Fallback if noUsersRow isn't found for some reason (should not happen)
+            document.querySelector('#usersTable tbody').innerHTML = `<tr><td colspan="13" style="text-align:center;">${getTranslation('Not connected to Mikrotik router.')}</td></tr>`;
+        }
         document.querySelector('#sessionsTable tbody').innerHTML = `<tr><td colspan="7" style="text-align:center;">${getTranslation('Not connected to Mikrotik router.')}</td></tr>`;
         document.querySelector('#profilesTable tbody').innerHTML = `<tr><td colspan="5" style="text-align:center;">${getTranslation('Not connected to Mikrotik router.')}</td></tr>`;
         const analyticsTotalDataEl = document.getElementById('analyticsTotalData');
@@ -917,31 +950,68 @@ async function loadDashboardStats() {
 }
 
 async function loadUsers(silent = false) {
-    const tbody = document.querySelector('#usersTable tbody');
+    const usersTableBody = document.querySelector('#usersTable tbody');
+    const loadingRow = document.getElementById('loadingUsersRow');
+    const noUsersRow = document.getElementById('noUsersRow');
+
+    // Helper to update placeholder rows
+    function showPlaceholderMessage(rowId, messageKey, colspan = 13) {
+        const row = document.getElementById(rowId);
+        if (row) {
+            const cell = row.querySelector('td');
+            cell.textContent = getTranslation(messageKey);
+            cell.setAttribute('colspan', colspan);
+            row.style.display = 'table-row';
+        }
+        if (rowId === 'loadingUsersRow' && noUsersRow) noUsersRow.style.display = 'none';
+        if (rowId === 'noUsersRow' && loadingRow) loadingRow.style.display = 'none';
+        if (usersTableBody && rowId === 'noUsersRow') usersTableBody.innerHTML = ''; // Clear other rows if showing "no users"
+    }
+
     if (!document.querySelector('#connectionStatus').classList.contains('connected') && !silent) {
-        tbody.innerHTML = `<tr><td colspan="9" style="text-align:center;">${getTranslation('Not connected to Mikrotik router. Cannot load users.')} <a href="#" onclick="navigateToTab('settings'); return false;">Configure Settings</a>.</td></tr>`;
+        showPlaceholderMessage('noUsersRow', 'Not connected to Mikrotik router. Cannot load users.');
+        currentUsers = [];
+        filterAndDisplayUsers(); // Update table display (will show the "no users" row with correct colspan)
         return;
     }
-    if (!silent) tbody.innerHTML = `<tr><td colspan="9" style="text-align:center;"><div class="loading-spinner"></div> ${getTranslation('Loading users...')}</td></tr>`;
+
+    if (!silent) {
+        if(usersTableBody) usersTableBody.innerHTML = ''; // Clear previous user rows before showing loading
+        showPlaceholderMessage('loadingUsersRow', 'Loading users...');
+    }
 
     const data = await apiCall('/users');
+    if(loadingRow) loadingRow.style.display = 'none'; // Hide loading row after API call
+
     if (data && data.users) {
         currentUsers = data.users;
-        filterAndDisplayUsers(); // This will show "No users match criteria" if empty after filter
-        if (currentUsers.length === 0 && !document.getElementById('userSearchInput').value && !document.getElementById('userFilterProfile').value && !document.getElementById('userFilterStatus').value) {
-             tbody.innerHTML = `<tr><td colspan="9" style="text-align:center;">${getTranslation('No users found on the router.')}</td></tr>`;
+        filterAndDisplayUsers(); // This will populate the table or show "No users match criteria" via noUsersRow
+
+        const isSearchActive = document.getElementById('userSearchInput').value;
+        const isProfileFilterActive = document.getElementById('userFilterProfile').value;
+        const isStatusFilterActive = document.getElementById('userFilterStatus').value;
+
+        if (currentUsers.length === 0 && !isSearchActive && !isProfileFilterActive && !isStatusFilterActive) {
+            // If no users on router and no filters active, show specific message
+            showPlaceholderMessage('noUsersRow', 'No users found on the router.');
+        } else if (filtered.length === 0) { // filterAndDisplayUsers would have set filtered.length
+             // This case is handled by filterAndDisplayUsers showing the noUsersRow with "No users match criteria"
         }
+        // If users are displayed, filterAndDisplayUsers clears the tbody and noUsersRow is hidden.
+
     } else if (data === null && document.querySelector('#connectionStatus').classList.contains('connected')) {
-        // Data is null but connection status was 'connected' - implies an issue during API call not related to initial connection
-        tbody.innerHTML = `<tr><td colspan="9" style="text-align:center;">${getTranslation('Error loading users. Please try again.')}</td></tr>`;
+        showPlaceholderMessage('noUsersRow', 'Error loading users. Please try again.');
+        currentUsers = [];
+        filterAndDisplayUsers();
     } else if (!document.querySelector('#connectionStatus').classList.contains('connected')) {
-        // If not connected, filterAndDisplayUsers might not be called or might show "no users match"
-        // Ensure a clear message about connection is shown if users couldn't be loaded due to it.
-        // This is partly redundant with the check at the start of the function.
-        tbody.innerHTML = `<tr><td colspan="9" style="text-align:center;">${getTranslation('Not connected to Mikrotik router. Cannot load users.')}</td></tr>`;
+        showPlaceholderMessage('noUsersRow', 'Not connected to Mikrotik router. Cannot load users.');
+        currentUsers = [];
+        filterAndDisplayUsers();
+    } else { // Other unexpected error or empty data.users
+        showPlaceholderMessage('noUsersRow', 'Could not retrieve user data.');
+        currentUsers = [];
+        filterAndDisplayUsers();
     }
-    // If data is not null but data.users is missing, it's an unexpected response.
-    // The general error from apiCall might cover this, or a specific message here.
 }
 
 
@@ -1129,27 +1199,74 @@ function filterAndDisplayUsers() {
     });
     
     const tbody = document.querySelector('#usersTable tbody');
+    const noUsersRow = document.getElementById('noUsersRow');
+    tbody.innerHTML = ''; // Clear existing rows before adding new ones or "no users" message
+
     if (filtered.length === 0) {
-        tbody.innerHTML = `<tr><td colspan="9" style="text-align:center;">No users match the criteria.</td></tr>`;
+        if (noUsersRow) {
+            noUsersRow.querySelector('td').textContent = getTranslation('No users match the criteria.');
+            noUsersRow.querySelector('td').setAttribute('colspan', '13');
+            noUsersRow.style.display = 'table-row';
+        }
         return;
     }
 
-    tbody.innerHTML = filtered.map(user => `
-        <tr>
-            <td>${user.name}</td>
-            <td>${user.profile || ''}</td>
-            <td><span class="status-badge ${user.disabled === 'true' ? 'status-disabled' : 'status-active'}">${user.disabled === 'true' ? 'Disabled' : 'Active'}</span></td>
-            <td>${user['limit-uptime'] || 'Unlimited'}</td>
-            <td>${formatBytes(user['limit-bytes-total'])}</td>
-            <td>${user.uptime || '0s'}</td>
-            <td>${formatBytes(parseInt(user['bytes-in'] || 0) + parseInt(user['bytes-out'] || 0))}</td>
-            <td>${user.comment || ''}</td>
-            <td style="white-space:nowrap;">
-                <button class="btn btn-primary btn-sm" onclick="openUserModal('${user.name}')"><i class="fas fa-edit"></i></button>
-                <button class="btn btn-danger btn-sm" onclick="deleteUser('${user.name}')"><i class="fas fa-trash"></i></button>
-            </td>
-        </tr>
-    `).join('');
+    if (noUsersRow) noUsersRow.style.display = 'none'; // Hide if there are users to display
+
+    tbody.innerHTML = filtered.map(user => {
+        const statusBadge = `<span class="status-badge ${user.disabled === 'true' ? 'status-disabled' : 'status-active'}">${user.disabled === 'true' ? getTranslation('Disabled') : getTranslation('Active')}</span>`;
+        const uptimeLimit = user['limit-uptime'] || getTranslation('Unlimited');
+        // Use getTranslation('Unlimited') as the default for limits if '0' or invalid
+        const dataLimit = formatBytes(user['limit-bytes-total'], getTranslation('Unlimited'));
+        // Use '0 B' as the default for actual usage if '0' or invalid
+        const dataUsed = formatBytes((parseInt(user['bytes-in'] || 0) + parseInt(user['bytes-out'] || 0)), "0 B");
+
+        let allottedTimeDisplay = getTranslation('N/A');
+        let usedTimeDisplay = getTranslation('N/A');
+        let remainingTimeDisplay = getTranslation('N/A');
+        let timeBankStatusDisplay = getTranslation('N/A');
+        let pauseResumeButton = '';
+
+        if (user.time_bank_total_allotted_seconds !== null && user.time_bank_total_allotted_seconds !== undefined) {
+            allottedTimeDisplay = formatSecondsToDuration(user.time_bank_total_allotted_seconds);
+            usedTimeDisplay = formatSecondsToDuration(user.time_bank_cumulative_used_seconds);
+            remainingTimeDisplay = formatSecondsToDuration(user.time_bank_remaining_seconds);
+
+            if (user.time_bank_is_paused) {
+                timeBankStatusDisplay = `<span class="status-badge status-paused">${getTranslation('Paused')}</span>`;
+                if (user.time_bank_remaining_seconds > 0) {
+                    pauseResumeButton = `<button class="btn btn-success btn-sm" onclick="resumeUserTime('${user.name}')" title="${getTranslation('Resume Session')}"><i class="fas fa-play"></i></button>`;
+                }
+            } else if (user.time_bank_remaining_seconds <= 0) {
+                timeBankStatusDisplay = `<span class="status-badge status-danger">${getTranslation('Exhausted')}</span>`;
+            } else {
+                timeBankStatusDisplay = `<span class="status-badge status-active">${getTranslation('Managed')}</span>`;
+                pauseResumeButton = `<button class="btn btn-warning btn-sm" onclick="pauseUserTime('${user.name}')" title="${getTranslation('Pause Session')}"><i class="fas fa-pause"></i></button>`;
+            }
+        }
+
+        return `
+            <tr>
+                <td>${user.name}</td>
+                <td>${user.profile || ''}</td>
+                <td>${statusBadge}</td>
+                <td>${uptimeLimit}</td>
+                <td>${dataLimit}</td>
+                <td>${user.uptime || '0s'}</td>
+                <td>${dataUsed}</td>
+                <td>${user.comment || ''}</td>
+                <td>${allottedTimeDisplay}</td>
+                <td>${usedTimeDisplay}</td>
+                <td>${remainingTimeDisplay}</td>
+                <td>${timeBankStatusDisplay}</td>
+                <td style="white-space:nowrap;">
+                    <button class="btn btn-primary btn-sm" onclick="openUserModal('${user.name}')" title="${getTranslation('Edit User')}"><i class="fas fa-edit"></i></button>
+                    <button class="btn btn-danger btn-sm" onclick="deleteUser('${user.name}')" title="${getTranslation('Delete User')}"><i class="fas fa-trash"></i></button>
+                    ${pauseResumeButton}
+                </td>
+            </tr>
+        `;
+    }).join('');
 }
 
 function displayProfiles() {
@@ -1202,6 +1319,7 @@ async function handleCreateUser(e) {
         'limit-uptime': document.getElementById('timeLimit').value,
         'limit-bytes-total': document.getElementById('dataLimit').value ? parseInt(document.getElementById('dataLimit').value) * 1024 * 1024 : null,
         comment: document.getElementById('comment').value,
+        enable_time_banking: document.getElementById('enableTimeBanking').checked
     };
     const result = await apiCall('/users', { method: 'POST', body: JSON.stringify(payload) });
     if(result && result.success) {
@@ -1225,7 +1343,8 @@ async function handleBulkCreateUsers(e) {
         username_length: parseInt(document.getElementById('bulkUsernameLength').value),
         username_charset: document.getElementById('bulkUsernameCharset').value,
         password_length: parseInt(document.getElementById('bulkPasswordLength').value),
-        password_charset: document.getElementById('bulkPasswordCharset').value
+        password_charset: document.getElementById('bulkPasswordCharset').value,
+        enable_time_banking: document.getElementById('bulkEnableTimeBanking').checked
     };
 
     const exportHTMLBtn = document.getElementById('exportVouchersHTMLButton');
@@ -1310,18 +1429,44 @@ async function handleProfileSave(e) {
 }
 
 async function deleteUser(username) {
-    if (!confirm(`Are you sure you want to delete user "${username}"?`)) return;
+    if (!confirm(getTranslation('confirmDeleteUser', username))) return;
     const result = await apiCall(`/users/${username}`, { method: 'DELETE' });
     if(result && result.success) {
-        showAlert('globalAlert', 'success', `User "${username}" deleted.`);
+        showAlert('globalAlert', 'success', getTranslation('User "{0}" deleted.', username));
         await loadUsers();
         await loadDashboardStats();
     }
 }
 
+async function pauseUserTime(username) {
+    if (!confirm(getTranslation('Are you sure you want to pause the session for user "{0}"? Their current uptime will be recorded, and they will be disconnected and disabled on the router.', username))) return;
+    const result = await apiCall(`/users/${username}/pause-time`, { method: 'POST' });
+    if (result && result.success) {
+        showAlert('globalAlert', 'success', result.message || getTranslation('User {0} session paused successfully.', username));
+        loadUsers(); // Refresh user list to update button and status
+    } else if (result) {
+        showAlert('globalAlert', 'danger', result.message || getTranslation('Failed to pause session for user {0}.', username));
+    }
+    // If result is null, apiCall handles the generic error
+}
+
+// Placeholder for resumeUserTime - to be implemented in next step
+async function resumeUserTime(username) {
+    if (!confirm(getTranslation('Are you sure you want to resume the session for user "{0}"? Their remaining time will be applied and they will be re-enabled on the router.', username))) return;
+    const result = await apiCall(`/users/${username}/resume-time`, { method: 'POST' });
+    if (result && result.success) {
+        showAlert('globalAlert', 'success', result.message || getTranslation('User {0} session resumed successfully.', username));
+        loadUsers(); // Refresh user list
+    } else if (result) {
+        showAlert('globalAlert', 'danger', result.message || getTranslation('Failed to resume session for user {0}.', username));
+    }
+    // apiCall handles generic errors
+}
+
+
 async function disconnectUser(activeId) {
     const session = currentSessions.find(s => s['.id'] === activeId);
-    if (!confirm(`Are you sure you want to disconnect user "${session.user}"?`)) return;
+    if (!confirm(getTranslation('confirmDisconnectUser', session.user))) return;
     const result = await apiCall(`/disconnect-user/${activeId}`, { method: 'POST' });
     if (result && result.success) {
         showAlert('globalAlert', 'success', `User disconnected.`);
@@ -1604,14 +1749,61 @@ async function loadAnalyticsData() {
 }
 
 
-function formatBytes(bytes) {
-    if (bytes === null || bytes === undefined || bytes === '' || isNaN(bytes)) return 'Unlimited';
+function formatBytes(bytes, defaultForZeroOrInvalid = getTranslation('Unlimited')) {
+    // This function is used for both data limits and data usage.
+    // For data limits, "0" often means "Unlimited".
+    // For data usage, "0" means "0 B".
+    // The `defaultForZeroOrInvalid` parameter helps control this.
+    // If `getTranslation('Unlimited')` is passed, "0" will become "Unlimited".
+    // If `getTranslation('N/A')` or "0 B" is passed, "0" will become that.
+
+    if (bytes === null || bytes === undefined || bytes === '') {
+        return defaultForZeroOrInvalid;
+    }
     const numBytes = Number(bytes);
-    if (numBytes === 0) return '0 B';
+    if (isNaN(numBytes)) {
+        return defaultForZeroOrInvalid;
+    }
+    if (numBytes === 0) {
+        // If defaultForZeroOrInvalid is 'Unlimited', then 0 means unlimited.
+        // Otherwise, treat 0 as '0 B' or whatever else was passed.
+        return defaultForZeroOrInvalid === getTranslation('Unlimited') ? getTranslation('Unlimited') : (numBytes === 0 ? "0 B" : defaultForZeroOrInvalid) ;
+    }
+
     const k = 1024;
     const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+    // Handle very small byte values that are less than 1KB after division but not 0
+    if (numBytes < k && numBytes > 0) return `${numBytes.toFixed(0)} B`;
+
     const i = Math.floor(Math.log(numBytes) / Math.log(k));
-    return `${parseFloat((numBytes / Math.pow(k, i)).toFixed(2))} ${sizes[i]}`;
+    const safeIndex = Math.min(i, sizes.length - 1); // Ensure index is within bounds
+
+    return `${parseFloat((numBytes / Math.pow(k, safeIndex)).toFixed(2))} ${sizes[safeIndex]}`;
+}
+
+// New helper function to format seconds into a duration string
+function formatSecondsToDuration(totalSeconds) {
+    if (totalSeconds === null || totalSeconds === undefined || isNaN(totalSeconds) || totalSeconds < 0) {
+        return getTranslation('N/A');
+    }
+    if (totalSeconds === 0) return "0s";
+
+    const days = Math.floor(totalSeconds / (3600 * 24));
+    const hours = Math.floor((totalSeconds % (3600 * 24)) / 3600);
+    const minutes = Math.floor((totalSeconds % 3600) / 60);
+    const seconds = Math.floor(totalSeconds % 60);
+
+    let parts = [];
+    if (days > 0) parts.push(days + "d");
+    if (hours > 0) parts.push(hours + "h");
+    if (minutes > 0) parts.push(minutes + "m");
+    // Always show seconds if other parts are zero and totalSeconds was > 0,
+    // or if totalSeconds is less than a minute (and > 0).
+    if (seconds > 0 || (parts.length === 0 && totalSeconds > 0) ) {
+        parts.push(seconds + "s");
+    }
+
+    return parts.length > 0 ? parts.join(" ") : "0s"; // Default to "0s" if somehow no parts (e.g. totalSeconds was 0 initially, handled above)
 }
 </script>
 </body>
